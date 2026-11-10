@@ -6,7 +6,11 @@ BASE="http://localhost:$PORT"
 DATA=/tmp/fclip-e2e
 
 # 1. fresh server (setsid so it can outlive this shell if needed)
-pkill -f "standalone/server.js" 2>/dev/null; sleep 1
+# NOTE: Next.js renames the process to "next-server (v…)" — pkill by that
+# title (or fall back to the port owner), NOT by server.js path.
+pkill -f "next-server" 2>/dev/null; sleep 1
+PID=$(ss -tlnp 2>/dev/null | grep :3999 | grep -oP 'pid=\K[0-9]+' | head -1)
+[ -n "${PID:-}" ] && kill "$PID" 2>/dev/null && sleep 1
 cd /home/z/my-project/.next/standalone
 setsid env PORT=$PORT FCLIP_DATA_DIR=$DATA NODE_ENV=production \
   nohup node server.js > /tmp/fclip-e2e.log 2>&1 < /dev/null &
