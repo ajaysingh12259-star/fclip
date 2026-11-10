@@ -145,7 +145,7 @@ Cloud IPs get rate-limited by YouTube. fclip already fights back for you:
 | Thing | Value |
 | --- | --- |
 | Max clip length | 1 hour (per clip) |
-| 4K / 2K | Delivered as VP9/AV1 in WebM/MKV (that's how YouTube serves it) — plays in browsers & VLC. Pick 1080p for classic MP4/H.264. |
+| 4K / 2K | With cookies: VP9/AV1 in WebM/MKV (that's how YouTube serves it) — plays in browsers & VLC. Cookie-less: explicit 4K/2K picks ride the 4K render relays (measured live: 3840x2160 AV1 60fps + AAC mp4, no cookies) — the render farm processes the whole source, so keep it under ~25 min; if every relay is busy the clip lands in 1080p60, then 360p. Pick 1080p for classic MP4/H.264 output. |
 | Fast mode | Keyframe-aligned cut (±2 s), instant, no re-encode |
 | Frame-accurate mode | Exact times, but re-encodes the boundaries (slow at 4K) |
 | Job list | In memory — restarting the app clears the *list* (files in the volume are cleaned by age/disk guard) |
