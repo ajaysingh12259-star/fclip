@@ -92,10 +92,20 @@ export const YtPlayer = forwardRef<YtPlayerHandle, Props>(function YtPlayer(
   const hostRef = useRef<HTMLDivElement>(null);
   const playerRef = useRef<YTPlayer | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
+  const [lastVideoId, setLastVideoId] = useState(videoId);
+
+  // Video changed — clear stale error state (React's render-phase reset pattern).
+  if (lastVideoId !== videoId) {
+    setLastVideoId(videoId);
+    setFailed(null);
+  }
   const onReadyRef = useRef(onReady);
   const onErrorRef = useRef(onError);
-  onReadyRef.current = onReady;
-  onErrorRef.current = onError;
+
+  useEffect(() => {
+    onReadyRef.current = onReady;
+    onErrorRef.current = onError;
+  }, [onReady, onError]);
 
   useImperativeHandle(ref, () => ({
     getCurrentTime: () => {
@@ -146,7 +156,6 @@ export const YtPlayer = forwardRef<YtPlayerHandle, Props>(function YtPlayer(
     let alive = true;
     const host = hostRef.current;
     playerRef.current = null;
-    setFailed(null);
     loadIframeApi()
       .then((YT) => {
         if (!alive || !host) return;
