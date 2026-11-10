@@ -33,7 +33,7 @@ RUN apt-get update \
  && chmod +x /usr/local/bin/wgcf \
  && curl -fsSL -o /tmp/wireproxy.tar.gz https://github.com/windtf/wireproxy/releases/download/v1.1.3/wireproxy_linux_amd64.tar.gz \
  && tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin wireproxy && chmod +x /usr/local/bin/wireproxy && rm -f /tmp/wireproxy.tar.gz \
- && wgcf --version && wireproxy --version
+ && wgcf --help > /dev/null && wireproxy --version
 
 WORKDIR /app
 ENV NODE_ENV=production \
