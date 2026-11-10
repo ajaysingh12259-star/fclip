@@ -1160,14 +1160,16 @@ async function relayCut(
   }
 
   // 2. HD: VideoLimit render relay (server-side cut, 1080p60 ceiling, free tier).
-  //    Skipped for explicit 1440p/4K requests — their ceiling is 1080p60 and
-  //    letting it run would silently downgrade a 4K pick (the 4K lanes below
-  //    would never fire).
+  //    For explicit 1440p/4K picks this lane runs LAST (after the 4K lanes) —
+  //    see 3c — so a 4K request degrades to true 1080p60 only when every
+  //    4K relay is unavailable, never before.
   const videoId = extractVideoId(params.url);
   const videoLen = cachedRelayDuration(videoId ?? "");
   const clipLen = params.end - params.start;
   const want4k = params.maxHeight != null && params.maxHeight >= 1440;
-  if (wantHd && !want4k && videoId && clipLen <= 10 * 60) {
+  /** VideoLimit 1080p60 render lane. Returns true when the clip is done. */
+  const tryVideolimitLane = async (): Promise<boolean> => {
+    if (!videoId || clipLen > 10 * 60) return false;
     try {
       job.status = "running";
       job.stage = "Relay: rendering HD clip (1080p60)";
@@ -1181,14 +1183,16 @@ async function relayCut(
       if (ok) {
         job.stage = "Finalizing";
         job.progress = 100;
-        return;
+        return true;
       }
-      job.log.push("[fclip] rendered clip download failed — falling back to tunnel relays…");
+      job.log.push("[fclip] rendered clip download failed — falling back…");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      job.log.push(`[fclip] HD render relay unavailable (${msg}) — trying tunnel relays…`);
+      job.log.push(`[fclip] HD render relay unavailable (${msg}) — trying next lane…`);
     }
-  }
+    return false;
+  };
+  if (wantHd && !want4k && (await tryVideolimitLane())) return;
 
   // 3. 1440p/4K attempts: full-download relays (whole source once → local
   //    range cut). Tunnel relays first (fast, direct re-serve); then the
@@ -1281,6 +1285,10 @@ async function relayCut(
       }
     }
   }
+
+  // 3c. 4K pick but every 4K lane refused: degrade to the true 1080p60
+  //     render rather than dumping the user at 360p.
+  if (want4k && (await tryVideolimitLane())) return;
 
   // 3. HD fallback: the turbo ranged cut (360p floor — never dead).
   if (formats) {
