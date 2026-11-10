@@ -121,6 +121,8 @@ export interface VideoInfo {
   isLive: boolean;
   chapters: { start: number; end: number; title: string }[] | null;
   qualities: { height: number; tbr: number | null; ext: string }[];
+  /** Set when extraction only succeeded via the bot-wall storm (no cookies): quality may be capped. */
+  qualityHint?: string | null;
   webpageUrl: string;
 }
 
@@ -133,6 +135,7 @@ const g = globalThis as unknown as {
   __fclipOptArgsOk: boolean | undefined;
   __fclipTvClientOk: boolean | undefined;
   __fclipMwebOk: boolean | undefined;
+  __fclipStormClient: { at: number; client: string } | undefined;
   __fclipEngine: { at: number; status: EngineStatus } | undefined;
 };
 
@@ -212,6 +215,148 @@ function mwebClientArgs(): string[] {
   return ["--extractor-args", "youtube:player_client=mweb"];
 }
 
+/* ------------------------------------------------------------------ */
+/* Bot-wall storm                                                     */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Brute-force the YouTube "sign in to confirm you're not a bot" wall from
+ * datacenter IPs. The wall is probabilistic per request: measured from a
+ * flagged IP, PARALLEL bursts of different player clients passed ~2/10 while
+ * sequential retries passed 0/8. So: fire a burst of yt-dlp processes, each
+ * claiming a different player identity, take the first breakthrough, kill
+ * the rest, and persist the winner so later requests start from it.
+ */
+const STORM_CLIENTS = ["android", "android_vr", "tv", "mweb"];
+const STORM_PATH = path.join(DATA_DIR, "storm.json");
+
+function recordStormWinner(client: string): void {
+  g.__fclipStormClient = { at: Date.now(), client };
+  try {
+    writeFileSync(STORM_PATH, JSON.stringify({ at: Date.now(), client }));
+  } catch {
+    /* persistence is best-effort */
+  }
+}
+
+function preferredStormClient(): string | null {
+  const mem = g.__fclipStormClient;
+  if (mem && Date.now() - mem.at < 24 * 60 * 60 * 1000) return mem.client;
+  try {
+    const j = JSON.parse(readFileSync(STORM_PATH, "utf8")) as { at?: number; client?: string };
+    if (j?.client && typeof j.at === "number" && Date.now() - j.at < 24 * 60 * 60 * 1000) {
+      g.__fclipStormClient = { at: j.at, client: j.client };
+      return j.client;
+    }
+  } catch {
+    /* no storm history yet */
+  }
+  return null;
+}
+
+export function stormStatus(): { winner: string | null; at: number | null } {
+  const c = preferredStormClient();
+  const mem = g.__fclipStormClient;
+  return { winner: c, at: mem ? mem.at : null };
+}
+
+interface StormResult {
+  res: RunResult;
+  client: string;
+}
+
+function stormAttempt(
+  client: string,
+  args: string[],
+  timeoutMs: number
+): { promise: Promise<StormResult>; kill: () => void } {
+  const full = [
+    ...coreArgs(),
+    ...cookieArgs(),
+    ...args,
+    "--extractor-args",
+    `youtube:player_client=${client}`,
+  ];
+  const child = spawn(YT_DLP, full, { stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  let settled = false;
+  const settle = (r: StormResult) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    resolveOuter(r);
+  };
+  let resolveOuter: (r: StormResult) => void = () => {};
+  const timer = setTimeout(() => {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already dead */
+    }
+  }, timeoutMs);
+  const promise = new Promise<StormResult>((resolve) => {
+    resolveOuter = resolve;
+    child.on("error", (err) => {
+      settle({ res: { code: 127, stdout: "", stderr: `fclip engine error: ${err.message}`, timedOut: false }, client });
+    });
+    child.stdout?.on("data", (d) => (stdout += d.toString()));
+    child.stderr?.on("data", (d) => (stderr += d.toString()));
+    child.on("close", (code) => {
+      settle({ res: { code: code ?? 1, stdout, stderr, timedOut: false }, client });
+    });
+  });
+  return {
+    promise,
+    kill: () => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already dead */
+      }
+    },
+  };
+}
+
+async function stormBurst(args: string[], timeoutMs: number, rounds: number): Promise<StormResult | null> {
+  const deadline = Date.now() + Math.min(Math.max(timeoutMs - 10_000, 60_000), 170_000);
+  for (let round = 1; round <= rounds; round++) {
+    if (Date.now() >= deadline) break;
+    // Round 1 starts with the last known breakthrough client, if any.
+    const preferred = preferredStormClient();
+    const clients =
+      preferred && round === 1
+        ? [preferred, ...STORM_CLIENTS.filter((c) => c !== preferred)]
+        : STORM_CLIENTS;
+    console.log(`[fclip-storm] round ${round}/${rounds}: ${clients.join(",")}`);
+    const attempts = clients.map((c) =>
+      stormAttempt(c, args, Math.max(20_000, deadline - Date.now()))
+    );
+    // Wait for the FIRST breakthrough; kill every loser the moment it appears.
+    const wrapped = attempts.map((a, i) => a.promise.then((r) => ({ i, ...r })));
+    const pending = new Set(attempts.map((_, i) => i));
+    let winner: { i: number; res: RunResult; client: string } | null = null;
+    while (pending.size > 0 && !winner) {
+      const done = await Promise.race([...pending].map((i) => wrapped[i]));
+      pending.delete(done.i);
+      if (done.res.code === 0 && done.res.stdout.trim().startsWith("{")) {
+        winner = done;
+      }
+    }
+    for (const a of attempts) a.kill(); // stragglers die; finished ones unaffected
+    if (winner) {
+      console.log(`[fclip-storm] breakthrough via "${winner.client}" in round ${round}`);
+      recordStormWinner(winner.client);
+      return { res: winner.res, client: winner.client };
+    }
+    console.log(`[fclip-storm] round ${round} exhausted`);
+    if (round < rounds) {
+      await new Promise((r2) => setTimeout(r2, 1500 + Math.round(Math.random() * 1500)));
+    }
+  }
+  return null;
+}
+
 function cookieArgs(): string[] {
   // Browser-cookie import is the quickest fix for the bot wall when fclip runs
   // on a desktop machine, e.g. FCLIP_COOKIES_FROM_BROWSER=chrome (or firefox,
@@ -239,6 +384,8 @@ interface RunResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** Set when this result came from a bot-wall storm breakthrough. */
+  stormClient?: string;
 }
 
 async function runYtDlp(args: string[], timeoutMs: number, url?: string): Promise<RunResult> {
@@ -280,6 +427,12 @@ async function runYtDlp(args: string[], timeoutMs: number, url?: string): Promis
     if (/invalid choice|unrecognized|no such option/i.test(r3.stderr + r3.stdout)) {
       g.__fclipTvClientOk = false; // yt-dlp too old for these clients — stop trying
     }
+  }
+  // Brute-force storm: parallel bursts of player-client identities until one
+  // breaks through the wall (see the storm block comment for the data).
+  if (r.code !== 0 && BOT_WALL_RE.test(r.stderr + r.stdout) && isYouTubeUrl(url ?? "")) {
+    const storm = await stormBurst(args, timeoutMs, 3);
+    if (storm) return { ...storm.res, stormClient: storm.client };
   }
   // Token-gated mweb client — with the bgutil PO-token provider this passes
   // both the player check and the googlevideo byte-range requests.
@@ -387,11 +540,7 @@ export function classifyError(stderrTail: string): { code: string; message: stri
   }
   const s = stderrTail.toLowerCase();
   if (s.includes("sign in to confirm") || s.includes("not a bot")) {
-    return {
-      code: "bot_check",
-      message:
-        "YouTube is asking this server to verify it is not a bot (common for cloud IPs). You can fix this by adding your browser cookies below, or run fclip locally where your own IP is used.",
-    };
+    return { code: "bot_check", message: botCheckMessage() };
   }
   if (s.includes("server returned 403") || s.includes("http error 403")) {
     return {
@@ -467,6 +616,10 @@ export async function fetchInfo(url: string): Promise<{ ok: true; info: VideoInf
       .filter((c) => typeof c.start_time === "number" && typeof c.end_time === "number")
       .map((c) => ({ start: c.start_time as number, end: c.end_time as number, title: c.title ?? "Chapter" })),
     qualities,
+    qualityHint:
+      res.stormClient && getCookiesMode() === "none"
+        ? "This clip was extracted through the bot-wall storm — YouTube may cap quality at ~360p for servers without login cookies. Upload your cookies in Settings for full HD."
+        : null,
     webpageUrl: raw.webpage_url ?? url,
   };
   return { ok: true, info };
@@ -569,6 +722,7 @@ export function createClipJob(params: CreateJobParams): ClipJob {
     return child;
   };
 
+  let retriedStorm = false;
   let retriedMweb = false;
   let retriedTvClient = false;
   let retriedPlain = false;
@@ -623,6 +777,31 @@ export function createClipJob(params: CreateJobParams): ClipJob {
       return;
     }
     const combined = job.log.join(" ") + stderrBuf;
+    // Bot wall during download — reuse the player client that broke through
+    // the wall during info extraction (persisted by the storm), or android,
+    // which measures as the most likely breakthrough client.
+    if (!retriedStorm && BOT_WALL_RE.test(combined) && isYouTubeUrl(params.url)) {
+      retriedStorm = true;
+      const client = preferredStormClient() ?? "android";
+      job.log.push(`[fclip] Bot wall — retrying download via the "${client}" client…`);
+      stdoutBuf = "";
+      stderrBuf = "";
+      child = attempt(["--extractor-args", `youtube:player_client=${client}`], `Retrying via ${client} client`);
+      child.stdout?.on("data", (d) => {
+        stdoutBuf += d.toString();
+        const parts = stdoutBuf.split("\n");
+        stdoutBuf = parts.pop() ?? "";
+        parts.forEach(pushLine);
+      });
+      child.stderr?.on("data", (d) => {
+        stderrBuf += d.toString();
+        const parts = stderrBuf.split("\n");
+        stderrBuf = parts.pop() ?? "";
+        parts.forEach((p) => pushLine(p));
+      });
+      child.on("close", onClose);
+      return;
+    }
     // Bot wall or missing GVS token — retry with the token-gated mweb client,
     // which the bgutil PO-token provider can fully satisfy.
     if (
@@ -954,4 +1133,79 @@ export function getCookiesMode(): "browser" | "file" | "none" {
   const browser = process.env.FCLIP_COOKIES_FROM_BROWSER || process.env.YTDLP_COOKIES_FROM_BROWSER;
   if (browser) return "browser";
   return existsSync(COOKIES_PATH) ? "file" : "none";
+}
+
+/* ------------------------------------------------------------------ */
+/* Cookie health (names only — never values)                          */
+/* ------------------------------------------------------------------ */
+
+export interface CookieHealth {
+  present: boolean;
+  /** True when the export contains YouTube login-session cookies. */
+  loggedIn: boolean;
+  /** Cookie NAMES only — values are never read or reported. */
+  names: string[];
+  lineCount: number;
+}
+
+const LOGIN_COOKIE_MARKERS = [
+  "SID",
+  "__Secure-1PSID",
+  "__Secure-3PSID",
+  "LOGIN_INFO",
+  "SAPISID",
+  "__Secure-1PAPISID",
+  "__Secure-3PAPISID",
+];
+
+export function cookieHealth(): CookieHealth {
+  if (getCookiesMode() === "browser") {
+    return { present: true, loggedIn: true, names: [], lineCount: 0 };
+  }
+  if (!existsSync(COOKIES_PATH)) {
+    return { present: false, loggedIn: false, names: [], lineCount: 0 };
+  }
+  try {
+    const lines = readFileSync(COOKIES_PATH, "utf8").split("\n");
+    const names = new Set<string>();
+    let count = 0;
+    for (const line of lines) {
+      if (!line.trim() || line.startsWith("#")) continue;
+      count++;
+      const name = line.split("\t")[5]?.trim();
+      if (name) names.add(name);
+    }
+    return {
+      present: count > 0,
+      loggedIn: LOGIN_COOKIE_MARKERS.some((m) => names.has(m)),
+      names: [...names].slice(0, 40),
+      lineCount: count,
+    };
+  } catch {
+    return { present: true, loggedIn: false, names: [], lineCount: 0 };
+  }
+}
+
+function botCheckMessage(): string {
+  const health = cookieHealth();
+  if (health.present && !health.loggedIn) {
+    return (
+      "YouTube is asking this server to verify it is not a bot. A cookies.txt is present, but it does not contain any " +
+      "YouTube login cookies (no SID / __Secure-1PSID / LOGIN_INFO) — it looks like an export made while signed out, " +
+      "so it cannot unlock the wall. fclip will keep retrying automatically with its client storm; for reliable HD " +
+      "clipping, export cookies again while signed in to YouTube and re-upload them in Settings."
+    );
+  }
+  if (health.present && health.loggedIn) {
+    return (
+      "YouTube is asking this server to verify it is not a bot even though login cookies are present. YouTube rotates " +
+      "session cookies fast — export a FRESH cookies.txt from a signed-in browser and re-upload it in Settings. fclip " +
+      "will also keep retrying automatically with its client storm."
+    );
+  }
+  return (
+    "YouTube is asking this server to verify it is not a bot (common for cloud IPs). fclip automatically retries with " +
+    "parallel client storms — but for reliable, full-quality clipping add your browser cookies in Settings, or run " +
+    "fclip locally where your own IP is used."
+  );
 }

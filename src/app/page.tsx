@@ -66,6 +66,7 @@ interface VideoInfo {
   isLive: boolean;
   chapters: { start: number; end: number; title: string }[] | null;
   qualities: { height: number; tbr: number | null; ext: string }[];
+  qualityHint?: string | null;
   webpageUrl: string;
 }
 
@@ -861,6 +862,12 @@ export default function Home() {
 
                 {clipInvalid && (
                   <p className="text-xs text-red-500">The end time must be after the start time.</p>
+                )}
+
+                {info.qualityHint && (
+                  <p className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                    {info.qualityHint}
+                  </p>
                 )}
 
                 {/* quality + precision */}
