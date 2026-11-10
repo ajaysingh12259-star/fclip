@@ -48,6 +48,7 @@ import {
   Play,
   Square,
   PencilLine,
+  ExternalLink,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -257,7 +258,11 @@ export default function Home() {
         setEnd(Math.round(Math.max(s + 1, e) * 10) / 10);
         setQuality("best");
       } catch {
-        setInfoError({ code: "network", message: "Could not reach the fclip server." });
+        setInfoError({
+          code: "network",
+          message:
+            "Could not reach the fclip server. If this is a fresh deployment, check the platform logs — serverless hosts such as Vercel can't run fclip (it needs a Docker-capable host).",
+        });
       } finally {
         setInfoLoading(false);
       }
@@ -609,9 +614,28 @@ export default function Home() {
           <section className="mb-6" aria-live="polite">
             <Alert className={infoError.code === "bot_check" ? "border-amber-500/50 bg-amber-500/10 text-amber-900 dark:text-amber-200" : "border-red-500/50 bg-red-500/10"}>
               <TriangleAlert className="h-4 w-4" aria-hidden />
-              <AlertTitle>{infoError.code === "bot_check" ? "YouTube wants to verify this server" : "Could not fetch this video"}</AlertTitle>
+              <AlertTitle>
+                {infoError.code === "bot_check"
+                  ? "YouTube wants to verify this server"
+                  : infoError.code === "engine_missing"
+                    ? "This server can't run fclip"
+                    : "Could not fetch this video"}
+              </AlertTitle>
               <AlertDescription className="mt-1.5 space-y-3 text-sm">
                 <p>{infoError.message}</p>
+                {infoError.code === "engine_missing" && (
+                  <div className="flex flex-wrap gap-2">
+                    <a
+                      href="https://github.com/ajay122596-rgb/fclip/blob/main/DEPLOY.md"
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      <Button size="sm" variant="outline" className="gap-2">
+                        <ExternalLink className="h-4 w-4" aria-hidden /> How to deploy fclip properly
+                      </Button>
+                    </a>
+                  </div>
+                )}
                 {infoError.code === "bot_check" && (
                   <div className="flex flex-wrap gap-2">
                     <Button size="sm" onClick={() => setCookiesOpen(true)} className="gap-2 bg-gradient-to-r from-red-500 to-orange-500 text-white hover:opacity-90">

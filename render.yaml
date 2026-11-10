@@ -1,0 +1,20 @@
+# Render blueprint — deploys fclip from this repo as a Docker web service.
+# Docs: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: fclip
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/health
+    autoDeploy: true
+    disk:
+      name: fclip-data
+      mountPath: /app/.data
+      sizeGB: 1
+    envVars:
+      # Optional but recommended on cloud IPs: full cookies.txt (Netscape)
+      # export from a throwaway Google account. See DEPLOY.md section 5.
+      - key: FCLIP_YT_COOKIES
+        sync: false
+      - key: NEXT_TELEMETRY_DISABLED
+        value: "1"

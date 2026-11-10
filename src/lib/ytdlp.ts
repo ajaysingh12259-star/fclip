@@ -2,7 +2,7 @@ import { spawn, execFile, execFileSync, type ChildProcess } from "child_process"
 import { promisify } from "util";
 
 const execFileAsync = promisify(execFile);
-import { existsSync, mkdirSync, readdirSync, statSync, rmSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, rmSync, writeFileSync } from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
 
@@ -19,6 +19,24 @@ export const DEMO_PATH = path.join(DATA_DIR, "demo.mp4");
 
 mkdirSync(CLIPS_DIR, { recursive: true });
 
+/* Cloud deploys (Railway / Render / Fly / VPS): paste a cookies.txt export into
+ * the FCLIP_YT_COOKIES (or YOUTUBE_COOKIES / YTDLP_COOKIES) env var and fclip
+ * materializes it as cookies.txt at boot. A file uploaded through the UI wins
+ * if one is already present. */
+const ENV_COOKIES =
+  process.env.FCLIP_YT_COOKIES ?? process.env.YOUTUBE_COOKIES ?? process.env.YTDLP_COOKIES;
+if (ENV_COOKIES && ENV_COOKIES.trim()) {
+  try {
+    if (!existsSync(COOKIES_PATH)) {
+      let c = ENV_COOKIES.replace(/\\r\\n/g, "\n").replace(/\\n/g, "\n").replace(/\\t/g, "\t").trim();
+      if (!c.startsWith("# Netscape")) c = `# Netscape HTTP Cookie File\n${c}`;
+      writeFileSync(COOKIES_PATH, c.endsWith("\n") ? c : `${c}\n`, { mode: 0o600 });
+    }
+  } catch {
+    /* non-fatal — yt-dlp will simply run without cookies */
+  }
+}
+
 function firstExisting(candidates: (string | undefined)[]): string | null {
   for (const c of candidates) {
     if (c && existsSync(c)) return c;
@@ -27,9 +45,12 @@ function firstExisting(candidates: (string | undefined)[]): string | null {
 }
 
 function findYtDlp(): string {
+  // An explicit override always wins — even if it doesn't exist — so a bad
+  // YTDLP_PATH surfaces as a clear "engine missing" error instead of being
+  // silently ignored in tests and CI.
+  if (process.env.YTDLP_PATH) return process.env.YTDLP_PATH;
   return (
     firstExisting([
-      process.env.YTDLP_PATH,
       "/home/z/.venv/bin/yt-dlp",
       "/usr/local/bin/yt-dlp",
       "/usr/bin/yt-dlp",
@@ -39,9 +60,9 @@ function findYtDlp(): string {
 }
 
 function findFfmpeg(): string {
+  if (process.env.FFMPEG_PATH) return process.env.FFMPEG_PATH;
   return (
     firstExisting([
-      process.env.FFMPEG_PATH,
       "/usr/bin/ffmpeg",
       "/usr/local/bin/ffmpeg",
       "/opt/homebrew/bin/ffmpeg",
@@ -50,9 +71,9 @@ function findFfmpeg(): string {
 }
 
 function findFfprobe(): string {
+  if (process.env.FFPROBE_PATH) return process.env.FFPROBE_PATH;
   return (
     firstExisting([
-      process.env.FFPROBE_PATH,
       "/usr/bin/ffprobe",
       "/usr/local/bin/ffprobe",
     ]) ?? "ffprobe"
@@ -111,6 +132,7 @@ const g = globalThis as unknown as {
   __fclipJobs: Map<string, ClipJob> | undefined;
   __fclipOptArgsOk: boolean | undefined;
   __fclipTvClientOk: boolean | undefined;
+  __fclipEngine: { at: number; status: EngineStatus } | undefined;
 };
 
 const jobs: Map<string, ClipJob> = (g.__fclipJobs ??= new Map());
@@ -259,15 +281,31 @@ function runOnce(useOptional: boolean, impersonate: boolean, args: string[], tim
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let settled = false;
+    const finish = (r: RunResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(r);
+    };
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGKILL");
     }, timeoutMs);
+    // Without this handler a missing/broken binary (ENOENT) would leave the
+    // promise pending forever or crash the function — e.g. on serverless hosts.
+    child.on("error", (err) => {
+      finish({
+        code: 127,
+        stdout: "",
+        stderr: `fclip engine error: ${err.message}`,
+        timedOut: false,
+      });
+    });
     child.stdout?.on("data", (d) => (stdout += d.toString()));
     child.stderr?.on("data", (d) => (stderr += d.toString()));
     child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ code: code ?? 1, stdout, stderr, timedOut });
+      finish({ code: code ?? 1, stdout, stderr, timedOut });
     });
   });
 }
@@ -299,7 +337,13 @@ interface RawInfo {
   webpage_url?: string;
 }
 
+const ENGINE_MISSING_RE =
+  /\benoent\b|engine error|no such file|command not found|cannot execute|not executable|permission denied/i;
+
 export function classifyError(stderrTail: string): { code: string; message: string } {
+  if (ENGINE_MISSING_RE.test(stderrTail)) {
+    return { code: "engine_missing", message: engineMissingMessage() };
+  }
   const s = stderrTail.toLowerCase();
   if (s.includes("sign in to confirm") || s.includes("not a bot")) {
     return {
@@ -465,6 +509,15 @@ export function createClipJob(params: CreateJobParams): ClipJob {
     job.proc = child;
     job.status = "running";
     job.stage = stageLabel;
+    // A spawn failure (binary missing → ENOENT) fires "error", not "close".
+    child.on("error", (err) => {
+      if (job.status === "canceled" || job.status === "done") return;
+      const msg = `[fclip] engine error: ${err.message}`;
+      job.log.push(msg);
+      job.status = "error";
+      job.stage = "Failed";
+      job.error = classifyError(msg).message;
+    });
     return child;
   };
 
@@ -751,6 +804,46 @@ export async function ensureDemoVideo(): Promise<string> {
 
 export function getBinaryPaths() {
   return { ytDlp: YT_DLP, ffmpeg: FFMPEG, ffprobe: FFPROBE };
+}
+
+export function isVercel(): boolean {
+  return process.env.VERCEL === "1";
+}
+
+export function engineMissingMessage(): string {
+  const base =
+    "The fclip server is missing its yt-dlp/ffmpeg engine. fclip needs a host that runs Docker or a long-lived Node process — Railway, Render, Fly.io, a VPS, or your own computer. Serverless platforms (Vercel, Netlify, Cloudflare) cannot run these binaries.";
+  return isVercel()
+    ? "This deployment is on Vercel, which can't run yt-dlp or ffmpeg. " + base
+    : base;
+}
+
+export interface EngineStatus {
+  ytDlp: boolean;
+  ffmpeg: boolean;
+  ffprobe: boolean;
+}
+
+async function probeBin(bin: string, args: string[]): Promise<boolean> {
+  try {
+    await execFileAsync(bin, args, { timeout: 20_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Cheap, cached reachability check of the yt-dlp/ffmpeg engine. */
+export async function checkEngine(force = false): Promise<EngineStatus> {
+  const cached = g.__fclipEngine;
+  if (!force && cached && Date.now() - cached.at < 60_000) return cached.status;
+  const status: EngineStatus = {
+    ytDlp: await probeBin(YT_DLP, ["--version"]),
+    ffmpeg: await probeBin(FFMPEG, ["-version"]),
+    ffprobe: await probeBin(FFPROBE, ["-version"]),
+  };
+  g.__fclipEngine = { at: Date.now(), status };
+  return status;
 }
 
 export function getCookiesMode(): "browser" | "file" | "none" {
