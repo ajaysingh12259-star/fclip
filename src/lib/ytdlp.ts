@@ -707,6 +707,15 @@ function relayToVideoInfo(relay: RelayInfo, url: string): VideoInfo {
   }
   const qualities = [...heights.values()].sort((a, b) => b.height - a.height).slice(0, 8);
   const turbo = relay.source === "clipscutter";
+  if (turbo) {
+    // The turbo route guarantees 360p; higher options are attemptable through
+    // the 4K-capable tunnel relays (measured live: 3840x2160 VP9, no cookies).
+    // If every relay refuses, the cut silently lands on the 360p floor.
+    for (const h of [2160, 1440, 1080, 720, 480]) {
+      if (!heights.has(h)) heights.set(h, { height: h, tbr: null, ext: h >= 1440 ? "webm" : "mp4" });
+    }
+  }
+  const qualitiesFinal = [...heights.values()].sort((a, b) => b.height - a.height).slice(0, 8);
   return {
     id: relay.id,
     title: relay.title,
@@ -717,10 +726,10 @@ function relayToVideoInfo(relay: RelayInfo, url: string): VideoInfo {
     uploadDate: null,
     isLive: false,
     chapters: null,
-    qualities,
+    qualities: qualitiesFinal,
     route: "relay",
     qualityHint: turbo
-      ? "Turbo route active: this video is served through fclip's cookie-less relay backbone (residential-egress extraction + byte proxy). No YouTube cookies involved and no bot wall — quality is capped around 360p on this route; cookies in Settings unlock full HD."
+      ? "Turbo route active: served through fclip's cookie-less relay backbone — no bot wall, no login. 360p is guaranteed; higher options are attempted through 4K-capable tunnel relays (measured live up to 2160p VP9). If every relay refuses, your clip still lands in 360p."
       : "Served through fclip's cookie-less relay network (public Piped/Invidious instances) — no YouTube cookies involved. Relay quality usually tops out around 360–720p; for full 4K add cookies in Settings.",
     webpageUrl: url,
   };
@@ -1118,11 +1127,14 @@ async function urlServesBytes(url: string): Promise<boolean> {
 }
 
 /**
- * Cookie-less relay cut. Preferred byte path: a proxied progressive URL that
- * passes a live range probe (the clipscutter turbo relay) — ffmpeg then
- * streams ONLY the byte-ranges the clip needs, no full download. Fallback:
- * a Cobalt relay tunnels the full media through its own server so ANY IP can
- * download it. Last resort: instance-proxied googlevideo URLs.
+ * Cookie-less relay cut, ordered as a quality ladder:
+ *  1. For ≤480p requests: the turbo fast path (ranged stream-cut, cheapest).
+ *  2. For HD/4K requests: cobalt tunnels first — measured live, one host
+ *     tunnels TRUE 4K (3840x2160 VP9) from datacenter IPs with zero cookies.
+ *     Tunnels relay the full stream (no ranges), so the whole source is
+ *     downloaded once and ffmpeg stream-copies the range locally.
+ *  3. Turbo fast path as the HD fallback (360p floor — never dead).
+ *  4. Instance-proxied googlevideo URLs (rare).
  */
 async function relayCut(
   job: ClipJob,
@@ -1132,27 +1144,15 @@ async function relayCut(
 ): Promise<void> {
   const dur = Math.max(0.2, params.end - params.start);
   const out = path.join(dir, "clip.mp4");
+  const wantHd = params.maxHeight == null || params.maxHeight > 480;
 
-  // Turbo fast path: proxied progressive stream + verified ranged access →
-  // cut straight off the remote stream (only downloads ~the clip length).
-  if (formats) {
-    const pick = pickRelayMedia(formats, params.maxHeight);
-    const turboVideo = pick.video;
-    if (turboVideo && turboVideo.kind === "progressive" && turboVideo.proxied) {
-      job.status = "running";
-      job.stage = "Relay: probing turbo stream";
-      job.log.push("[fclip] probing the turbo relay for ranged byte access…");
-      const ok = await urlServesBytes(turboVideo.url);
-      if (ok) {
-        job.stage = "Relay: streaming cut via turbo proxy";
-        job.log.push("[fclip] turbo relay verified — cutting directly from the ranged stream…");
-        await ffmpegRelayUrlCut(job, { video: turboVideo, audio: pick.audio }, params, dur, out);
-        return;
-      }
-      job.log.push("[fclip] turbo relay refused ranged reads — falling back to tunnel relays…");
-    }
+  // 1. Cheap ranged cut — only sane for low-height requests.
+  if (!wantHd && formats) {
+    const done = await tryTurboFastPath(job, formats, params, dur, out);
+    if (done) return;
   }
 
+  // 2. HD/4K: tunnel relays (full download → local range cut).
   const videoLen = cachedRelayDuration(extractVideoId(params.url) ?? "");
   // Tunneling means downloading the whole video once — only sane up to ~45 min.
   const cobaltAllowed = videoLen === null || videoLen <= 45 * 60;
@@ -1184,12 +1184,46 @@ async function relayCut(
     }
   }
 
+  // 3. HD fallback: the turbo ranged cut (360p floor — never dead).
+  if (formats) {
+    const done = await tryTurboFastPath(job, formats, params, dur, out);
+    if (done) return;
+  }
+
+  // 4. Last resort: instance-proxied URLs (usually 403 — kept for completeness).
   const { video, audio } = formats ? pickRelayMedia(formats, params.maxHeight) : { video: undefined, audio: undefined };
   if (!video) throw new Error("relay network had no media for this video");
   await ffmpegRelayUrlCut(job, { video, audio }, params, dur, out);
   if ((job.status as string) === "canceled") return;
   job.stage = "Processing with ffmpeg";
   job.progress = 100;
+}
+
+/** Turbo fast path: proxied progressive stream + verified ranged access →
+ *  ffmpeg stream-cuts straight off the remote URL (downloads ~clip length
+ *  only). Returns true when the cut was completed. */
+async function tryTurboFastPath(
+  job: ClipJob,
+  formats: RelayFormat[],
+  params: CreateJobParams,
+  dur: number,
+  out: string
+): Promise<boolean> {
+  const pick = pickRelayMedia(formats, params.maxHeight);
+  const turboVideo = pick.video;
+  if (!turboVideo || turboVideo.kind !== "progressive" || !turboVideo.proxied) return false;
+  job.status = "running";
+  job.stage = "Relay: probing turbo stream";
+  job.log.push("[fclip] probing the turbo relay for ranged byte access…");
+  const ok = await urlServesBytes(turboVideo.url);
+  if (!ok) {
+    job.log.push("[fclip] turbo relay refused ranged reads — trying next relay…");
+    return false;
+  }
+  job.stage = "Relay: streaming cut via turbo proxy";
+  job.log.push("[fclip] turbo relay verified — cutting directly from the ranged stream…");
+  await ffmpegRelayUrlCut(job, { video: turboVideo, audio: pick.audio }, params, dur, out);
+  return true;
 }
 
 /** ffmpeg stream-copy cut straight from remote URL(s) with progress parsing. */
@@ -1336,7 +1370,21 @@ async function downloadTunnelFile(job: ClipJob, url: string, dest: string): Prom
 
 /** Stream-copy the selected range out of a local file (fast, lossless). */
 async function ffmpegLocalCut(job: ClipJob, src: string, start: number, dur: number, dir: string): Promise<void> {
-  const out = path.join(dir, "clip.mp4");
+  // Container must follow the codecs: tunnel relays can hand us 4K VP9/Opus
+  // (even with an .mp4 filename) — that belongs in a webm, not mp4.
+  let ext = "mp4";
+  try {
+    const { stdout } = await execFileAsync(
+      FFPROBE,
+      ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", src],
+      { timeout: 15_000 }
+    );
+    const v = stdout.trim().split("\n")[0] ?? "";
+    if (/^(vp9|vp8|av1)$/i.test(v)) ext = "webm";
+  } catch {
+    /* probe failed — default to mp4 */
+  }
+  const out = path.join(dir, ext === "webm" ? "clip.webm" : "clip.mp4");
   await new Promise<void>((resolve, reject) => {
     const child = spawn(
       FFMPEG,
@@ -1346,7 +1394,7 @@ async function ffmpegLocalCut(job: ClipJob, src: string, start: number, dur: num
         "-i", src,
         "-t", String(dur),
         "-c", "copy",
-        "-movflags", "faststart",
+        ...(ext === "webm" ? [] : ["-movflags", "faststart"]),
         out,
       ],
       { stdio: ["ignore", "pipe", "pipe"] }

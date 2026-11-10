@@ -71,6 +71,21 @@ const INVIDIOUS_HOSTS = [
 
 const COBALT_HOSTS = ["co.otomir23.me", "dwnld.nichind.dev"];
 
+/**
+ * Cobalt host capability, measured live 2026-11-10 with byte-verified tunnels:
+ *  - dwnld.nichind.dev tunnels TRUE 4K — vp9 2160p request returned a stream
+ *    that ffprobe reads as 3840x2160 VP9. Served from a datacenter IP with
+ *    zero cookies.
+ *  - co.otomir23.me honors h264 (≤1080p); it refused a vp9/2160 request.
+ * For ≥1440p requests the 4K-capable host is tried first; tunnels do not
+ * support range requests (full-stream relay), so the first successful
+ * download wins and the rest are never touched.
+ */
+function cobaltHostOrder(maxHeight: number | null): string[] {
+  const want4k = maxHeight == null || maxHeight >= 1440;
+  return want4k ? ["dwnld.nichind.dev", "co.otomir23.me"] : COBALT_HOSTS;
+}
+
 /* ------------------------------------------------------------------ */
 /* Turbo route: clipscutter residential-relay API                      */
 /* ------------------------------------------------------------------ */
@@ -208,14 +223,21 @@ export interface CobaltMedia {
  * so callers must verify actual bytes and try every candidate.
  */
 export async function fetchCobaltTunnels(pageUrl: string, maxHeight: number | null): Promise<CobaltMedia[]> {
-  const quality = maxHeight && maxHeight > 0 ? String(Math.min(Math.round(maxHeight), 1080)) : "1080";
-  const body = JSON.stringify({ url: pageUrl, videoQuality: quality, downloadMode: "auto" });
+  // h264 tops out at 1080p on YouTube; 1440p+ only exists as VP9/AV1.
+  const h = maxHeight && maxHeight > 0 ? Math.min(Math.round(maxHeight), 2160) : 2160;
+  const codec = h >= 1440 ? "vp9" : "h264";
+  const body = JSON.stringify({
+    url: pageUrl,
+    videoQuality: String(h),
+    youtubeVideoCodec: codec,
+    downloadMode: "auto",
+  });
   const results = await Promise.all(
-    COBALT_HOSTS.map(async (h): Promise<CobaltMedia | null> => {
-      const j = await fetchJsonPost(`https://${h}/`, body, 15_000);
+    cobaltHostOrder(maxHeight).map(async (h2): Promise<CobaltMedia | null> => {
+      const j = await fetchJsonPost(`https://${h2}/`, body, 15_000);
       const obj = j as { status?: string; url?: string } | null;
       if (obj && (obj.status === "tunnel" || obj.status === "redirect") && typeof obj.url === "string" && obj.url) {
-        return { url: obj.url, host: h };
+        return { url: obj.url, host: h2 };
       }
       return null;
     })
