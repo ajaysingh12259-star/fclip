@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { readFileSync, existsSync, statSync } from "fs";
 import { checkEngine, getBinaryPaths, getCookiesMode, cookieHealth, stormStatus, warpHealth, COOKIES_PATH } from "@/lib/ytdlp";
+import { relayHealth } from "@/lib/instances";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -59,6 +60,7 @@ export async function GET() {
     cookieHealth: cookieHealth(),
     storm: stormStatus(),
     warp: await warpHealth(),
+    relay: relayHealth(),
     cookiesMode: getCookiesMode(),
     binaries: getBinaryPaths(),
   });

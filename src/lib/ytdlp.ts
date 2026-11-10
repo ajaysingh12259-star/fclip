@@ -5,6 +5,13 @@ const execFileAsync = promisify(execFile);
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, rmSync, writeFileSync } from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
+import {
+  fetchRelayInfo,
+  pickRelayMedia,
+  extractVideoId,
+  type RelayFormat,
+  type RelayInfo,
+} from "@/lib/instances";
 
 /* ------------------------------------------------------------------ */
 /* Paths                                                              */
@@ -138,7 +145,20 @@ const g = globalThis as unknown as {
   __fclipStormClient: { at: number; client: string } | undefined;
   __fclipProxyOk: { at: number; ok: boolean } | undefined;
   __fclipEngine: { at: number; status: EngineStatus } | undefined;
+  __fclipRelay: { at: number; videoId: string; formats: RelayFormat[] } | undefined;
 };
+
+/* Relay formats from the last successful relay fetch — the clip job reuses
+ * them (30 min TTL) so a video that fell back to the relay tier for info
+ * also cuts through the relay without a second fan-out. */
+function rememberRelayFormats(videoId: string, formats: RelayFormat[]) {
+  g.__fclipRelay = { at: Date.now(), videoId, formats };
+}
+function cachedRelayFormats(videoId: string): RelayFormat[] | null {
+  const r = g.__fclipRelay;
+  if (r && r.videoId === videoId && Date.now() - r.at < 30 * 60_000) return r.formats;
+  return null;
+}
 
 const jobs: Map<string, ClipJob> = (g.__fclipJobs ??= new Map());
 
@@ -198,7 +218,10 @@ export function isYouTubeUrl(url: string): boolean {
  * "Sign in to confirm you're not a bot" wall that cloud IPs get — try them
  * once before giving up so a fresh deployment can work with zero setup.
  */
-const BOT_WALL_RE = /sign in to confirm|not a bot|bot check/i;
+// "No video formats found!" is a bot-wall variant: cookies on android-family
+// clients and SABR-only responses from tv-family clients both yield metadata
+// with an empty format list, so it must trigger the same retry ladder.
+const BOT_WALL_RE = /sign in to confirm|not a bot|bot check|no video formats found/i;
 const GVS_403_RE = /HTTP error 403|Server returned 403|Forbidden[\s\S]*googlevideo|googlevideo[\s\S]*403/i;
 
 function tvClientArgs(): string[] {
@@ -228,7 +251,8 @@ function mwebClientArgs(): string[] {
  * claiming a different player identity, take the first breakthrough, kill
  * the rest, and persist the winner so later requests start from it.
  */
-const STORM_CLIENTS = ["android", "android_vr", "tv_downgraded", "tv", "mweb", "web_safari"];
+const STORM_CLIENTS_COOKIELESS = ["android_vr", "android", "ios"];
+const STORM_CLIENTS_COOKIED = ["mweb", "web_safari", "tv"];
 const STORM_PATH = path.join(DATA_DIR, "storm.json");
 
 /* ------------------------------------------------------------------ */
@@ -325,11 +349,12 @@ function stormAttempt(
   client: string,
   args: string[],
   timeoutMs: number,
-  extraArgs: string[] = []
+  extraArgs: string[] = [],
+  cookies: string[] = []
 ): { promise: Promise<StormResult>; kill: () => void } {
   const full = [
     ...coreArgs(),
-    ...cookieArgs(),
+    ...cookies,
     ...extraArgs,
     ...args,
     "--extractor-args",
@@ -383,18 +408,33 @@ async function stormBurst(args: string[], timeoutMs: number, rounds: number): Pr
   const proxyArgs = await warpProxyArgs();
   for (let round = 1; round <= rounds; round++) {
     if (Date.now() >= deadline) break;
-    // Round 1 starts with the last known breakthrough client, if any.
+    // android-family clients are cookie-HOSTILE (cookies on them yield empty
+    // format lists), so they always run without cookies. Web-family clients
+    // are cookie-friendly and join the burst only when a jar exists.
+    const hasCookies = cookieArgs().length > 0;
     const preferred = preferredStormClient();
-    const clients =
-      preferred && round === 1
-        ? [preferred, ...STORM_CLIENTS.filter((c) => c !== preferred)]
-        : STORM_CLIENTS;
+    const cookieless = [...STORM_CLIENTS_COOKIELESS];
+    const cookied = hasCookies ? [...STORM_CLIENTS_COOKIED] : [];
+    // Round 1 leads with the last known breakthrough client, if any.
+    if (preferred && round === 1) {
+      if (cookied.includes(preferred)) cookied.sort((a, b) => (a === preferred ? -1 : b === preferred ? 1 : 0));
+      else cookieless.sort((a, b) => (a === preferred ? -1 : b === preferred ? 1 : 0));
+    }
+    const clients = [...cookieless, ...cookied];
     const egress = round % 2 === 0 && proxyArgs.length > 0 ? proxyArgs : [];
     console.log(
-      `[fclip-storm] round ${round}/${rounds}: ${clients.join(",")}${egress.length ? " via WARP" : ""}`
+      `[fclip-storm] round ${round}/${rounds}: ${clients.join(",")}${
+        cookied.length ? " (web-family with cookies)" : " (cookie-less)"
+      }${egress.length ? " via WARP" : ""}`
     );
     const attempts = clients.map((c) =>
-      stormAttempt(c, args, Math.min(45_000, Math.max(20_000, deadline - Date.now())), egress)
+      stormAttempt(
+        c,
+        args,
+        Math.min(45_000, Math.max(20_000, deadline - Date.now())),
+        egress,
+        cookied.includes(c) ? cookieArgs() : []
+      )
     );
     // Wait for the FIRST breakthrough; kill every loser the moment it appears.
     const wrapped = attempts.map((a, i) => a.promise.then((r) => ({ i, ...r })));
@@ -434,6 +474,9 @@ function coreArgs(): string[] {
   return [
     "--no-playlist",
     "--no-warnings",
+    // YouTube scores a whole IPv6 /64 as one unit and cloud IPv6 ranges are
+    // walled even harder than IPv4 — always go out over IPv4.
+    "--force-ipv4",
     "--socket-timeout",
     "30",
     "--retries",
@@ -613,6 +656,13 @@ export function classifyError(stderrTail: string): { code: string; message: stri
   if (s.includes("sign in to confirm") || s.includes("not a bot")) {
     return { code: "bot_check", message: botCheckMessage() };
   }
+  if (s.includes("no video formats found")) {
+    return {
+      code: "no_formats",
+      message:
+        "YouTube returned no playable streams (a bot-wall variant). fclip automatically retries with alternate clients and, if needed, its cookie-less relay network.",
+    };
+  }
   if (s.includes("server returned 403") || s.includes("http error 403")) {
     return {
       code: "stream_blocked",
@@ -635,6 +685,33 @@ export function classifyError(stderrTail: string): { code: string; message: stri
   return { code: "unknown", message: "Could not fetch video info. Double-check the link and try again." };
 }
 
+function relayToVideoInfo(relay: RelayInfo, url: string): VideoInfo {
+  const heights = new Map<number, { height: number; tbr: number | null; ext: string }>();
+  for (const f of relay.formats) {
+    if (f.height == null || f.kind === "audio") continue;
+    const prev = heights.get(f.height);
+    if (!prev || (f.bitrate ?? 0) > (prev.tbr ?? 0)) {
+      heights.set(f.height, { height: f.height, tbr: f.bitrate, ext: f.ext });
+    }
+  }
+  const qualities = [...heights.values()].sort((a, b) => b.height - a.height).slice(0, 8);
+  return {
+    id: relay.id,
+    title: relay.title,
+    channel: relay.uploader,
+    duration: relay.duration,
+    thumbnail: relay.thumbnail,
+    viewCount: null,
+    uploadDate: null,
+    isLive: false,
+    chapters: null,
+    qualities,
+    qualityHint:
+      "Served through fclip's cookie-less relay network (public Piped/Invidious instances) — no YouTube cookies involved. Relay quality usually tops out around 360–720p; for full 4K add cookies in Settings.",
+    webpageUrl: url,
+  };
+}
+
 export async function fetchInfo(url: string): Promise<{ ok: true; info: VideoInfo } | { ok: false; error: { code: string; message: string }; detail?: string }> {
   const res = await runYtDlp(["-J", "--no-playlist", url], 180_000, url);
   if (res.timedOut) {
@@ -642,7 +719,19 @@ export async function fetchInfo(url: string): Promise<{ ok: true; info: VideoInf
   }
   if (res.code !== 0) {
     const tail = (res.stderr || res.stdout).split("\n").filter(Boolean).slice(-3).join(" ");
-    return { ok: false, error: classifyError(tail), detail: tail.slice(-500) };
+    const err = classifyError(tail);
+    // Cookie-less relay tier: when yt-dlp is walled, public Piped/Invidious
+    // instances fetch the metadata — and later the media bytes — through
+    // their own IPs. No cookies, no fclip IP reputation involved.
+    if (isYouTubeUrl(url)) {
+      const videoId = extractVideoId(url);
+      const relay = videoId ? await fetchRelayInfo(videoId) : null;
+      if (relay) {
+        rememberRelayFormats(relay.id, relay.formats);
+        return { ok: true, info: relayToVideoInfo(relay, url) };
+      }
+    }
+    return { ok: false, error: err, detail: tail.slice(-500) };
   }
   let raw: RawInfo;
   try {
@@ -797,6 +886,8 @@ export function createClipJob(params: CreateJobParams): ClipJob {
   let retriedMweb = false;
   let retriedTvClient = false;
   let retriedPlain = false;
+  let retriedRelay = false;
+  let relayError: string | null = null;
   let child = attempt([], "Resolving video streams");
 
   const pushLine = (line: string) => {
@@ -839,7 +930,7 @@ export function createClipJob(params: CreateJobParams): ClipJob {
     parts.forEach((p) => pushLine(p));
   });
 
-  const onClose = (code: number | null): void => {
+  const onClose = async (code: number | null): Promise<void> => {
     if (job.status === "canceled") return;
     job.proc = undefined;
     if (stderrBuf.trim()) pushLine(stderrBuf.trim());
@@ -952,15 +1043,121 @@ export function createClipJob(params: CreateJobParams): ClipJob {
       }, 2000);
       return;
     }
+    // Last resort, fully cookie-less: cut through the relay network with
+    // ffmpeg directly over the instance-proxied media URLs.
+    if (!retriedRelay && isYouTubeUrl(params.url)) {
+      retriedRelay = true;
+      const videoId = extractVideoId(params.url);
+      let formats = videoId ? cachedRelayFormats(videoId) : null;
+      if (!formats && videoId) {
+        const relay = await fetchRelayInfo(videoId);
+        if (relay) {
+          rememberRelayFormats(relay.id, relay.formats);
+          formats = relay.formats;
+        }
+      }
+      if (formats) {
+        job.log.push("[fclip] yt-dlp exhausted — switching to the cookie-less relay network…");
+        job.stage = "Cutting via relay network";
+        try {
+          await relayCut(job, dir, formats, params);
+          if ((job.status as string) !== "canceled") finalizeJob(job, dir);
+          return;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          job.log.push(`[fclip] relay cut failed: ${msg}`);
+          relayError = /403|Forbidden|denied/i.test(msg)
+            ? "The relay network served this video's info but its media proxy refused the byte stream (YouTube IP-locks relayed streams). The client storm or cookies provide the reliable cutting path — try again, or add cookies in Settings."
+            : `Relay cut failed: ${msg}`;
+        }
+      }
+    }
     job.status = "error";
     const tail = job.log.slice(-4).join(" ");
-    job.error = classifyError(tail).message;
+    job.error = relayError ?? classifyError(tail).message;
     job.stage = "Failed";
   };
 
   child.on("close", onClose);
 
   return job;
+}
+
+/**
+ * Cookie-less relay cut: ffmpeg reads the instance-proxied media URLs over
+ * HTTP and writes the selected time range with stream copy (fast, lossless).
+ * Used when yt-dlp is walled AND no relay-hostile combination helped.
+ */
+async function relayCut(
+  job: ClipJob,
+  dir: string,
+  formats: RelayFormat[],
+  params: CreateJobParams
+): Promise<void> {
+  const { video, audio } = pickRelayMedia(formats, params.maxHeight);
+  if (!video) throw new Error("no cuttable media stream in the relay response");
+  const dur = Math.max(0.2, params.end - params.start);
+  const out = path.join(dir, "clip.mp4");
+
+  const args = ["-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-y"];
+  // -ss before each -i seeks that input; -t bounds the output duration.
+  args.push("-ss", String(params.start), "-i", video.url);
+  if (audio) args.push("-ss", String(params.start), "-i", audio.url);
+  args.push("-t", String(dur));
+  if (audio) {
+    args.push("-map", "0:v:0", "-map", "1:a:0");
+    if (video.ext === "mp4" && audio.ext === "m4a") args.push("-c:v", "copy", "-c:a", "copy");
+    else args.push("-c:v", "copy", "-c:a", "aac", "-b:a", "160k"); // opus/webm cannot live in mp4
+  } else {
+    args.push("-c", "copy");
+  }
+  args.push("-movflags", "faststart", out);
+
+  job.status = "running";
+  job.stage = audio ? "Relay: cutting video + audio" : "Relay: cutting clip";
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(FFMPEG, args, { stdio: ["ignore", "pipe", "pipe"] });
+    job.proc = child;
+    let buf = "";
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already dead */
+      }
+      reject(new Error("relay cut timed out"));
+    }, Math.min(15 * 60_000, dur * 8_000 + 120_000));
+    child.stdout?.on("data", (d) => {
+      buf += d.toString();
+      const parts = buf.split("\n");
+      buf = parts.pop() ?? "";
+      for (const line of parts) {
+        const m = /out_time_ms=(\d+)/.exec(line);
+        if (m) {
+          const t = Number(m[1]) / 1e6;
+          if (Number.isFinite(t) && dur > 0) job.progress = Math.min(99, Math.round((t / dur) * 100));
+        }
+      }
+    });
+    child.stderr?.on("data", (d) => {
+      const l = d.toString().trim();
+      if (l) job.log.push(`[relay-ffmpeg] ${l.slice(0, 260)}`);
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if ((job.status as string) === "canceled") return resolve();
+      if (code === 0) resolve();
+      else reject(new Error(`relay ffmpeg exited ${code}`));
+    });
+  });
+  if ((job.status as string) === "canceled") return;
+  job.stage = "Processing with ffmpeg";
+  job.progress = 100;
 }
 
 async function finalizeJob(job: ClipJob, dir: string) {

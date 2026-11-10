@@ -30,9 +30,12 @@ export async function GET(req: Request) {
   const downloadName = `fclip-${safeTitle(job.title)}-${Math.round(job.start)}s-${Math.round(job.end)}s.${ext}`;
 
   const range = req.headers.get("range");
+  // ?inline=1 lets the browser <video> preview play the clip in place;
+  // the default stays "attachment" so plain links still download.
+  const disposition = searchParams.get("inline") === "1" ? "inline" : "attachment";
   const headers = new Headers({
     "Content-Type": ext === "webm" ? "video/webm" : "video/mp4",
-    "Content-Disposition": `attachment; filename="fclip-clip.${ext}"; filename*=UTF-8''${encodeURIComponent(downloadName)}`,
+    "Content-Disposition": `${disposition}; filename="fclip-clip.${ext}"; filename*=UTF-8''${encodeURIComponent(downloadName)}`,
     "Accept-Ranges": "bytes",
     "Cache-Control": "no-store",
   });

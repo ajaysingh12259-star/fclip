@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { motion } from "framer-motion";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
@@ -10,12 +11,12 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import {
   Accordion,
   AccordionContent,
@@ -26,6 +27,7 @@ import { useToast } from "@/hooks/use-toast";
 import { Timeline } from "@/components/fclip/timeline";
 import { YtPlayer, type YtPlayerHandle } from "@/components/fclip/yt-player";
 import { CookiesDialog } from "@/components/fclip/cookies-dialog";
+import { DiagPanel } from "@/components/fclip/diag-panel";
 import {
   Scissors,
   Link2,
@@ -42,13 +44,18 @@ import {
   XCircle,
   CheckCircle2,
   Trash2,
-  SlidersHorizontal,
   ShieldCheck,
   Globe,
   Play,
   Square,
   PencilLine,
   ExternalLink,
+  Gauge,
+  Activity,
+  Wand2,
+  Zap,
+  MousePointerClick,
+  ListVideo,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -170,6 +177,31 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<{ ok: bool
   return { ok: res.ok, data };
 }
 
+function qualityLabel(h: number): string {
+  if (h >= 4320) return `${h}p · 8K`;
+  if (h >= 2160) return `${h}p · 4K`;
+  if (h >= 1440) return `${h}p · 2K`;
+  return `${h}p`;
+}
+
+/** Map the server's stage text onto the 4-step tracker. */
+function stageIndex(stage: string, status: JobView["status"]): number {
+  if (status === "done") return 3;
+  if (status === "error" || status === "canceled") return -1;
+  const s = stage.toLowerCase();
+  if (/merg|process|correct|ffmpeg/.test(s)) return 2;
+  if (/download|byte|relay|cut/.test(s)) return 1;
+  return 0;
+}
+
+const STAGES = ["Resolve", "Fetch ranges", "Mux", "Ready"];
+
+const SAMPLES = [
+  { label: "Me at the zoo", url: "https://www.youtube.com/watch?v=jNQXAC9IVRw" },
+  { label: "Big Buck Bunny (CC)", url: "https://www.youtube.com/watch?v=aqz-KE-bpKQ" },
+  { label: "Blender: Elephants Dream (CC)", url: "https://www.youtube.com/watch?v=TLkA0RELQ1g" },
+];
+
 /* ------------------------------------------------------------------ */
 /* Page                                                               */
 /* ------------------------------------------------------------------ */
@@ -197,6 +229,8 @@ export default function Home() {
 
   const [cookiesOpen, setCookiesOpen] = useState(false);
   const [cookiesPresent, setCookiesPresent] = useState(false);
+  const [diagOpen, setDiagOpen] = useState(false);
+  const [engineUp, setEngineUp] = useState<boolean | null>(null);
 
   /** Server hit the YouTube bot wall — we keep going using the in-browser player. */
   const [fallbackPending, setFallbackPending] = useState(false);
@@ -221,6 +255,9 @@ export default function Home() {
     void refreshRecent();
     void jsonFetch<{ present: boolean }>("/api/cookies").then(({ ok, data }) => {
       if (ok) setCookiesPresent(data.present);
+    });
+    void jsonFetch<{ ok: boolean }>("/api/health").then(({ ok, data }) => {
+      setEngineUp(ok && data.ok !== false);
     });
   }, [refreshRecent]);
 
@@ -258,6 +295,9 @@ export default function Home() {
         setStart(Math.round(s * 10) / 10);
         setEnd(Math.round(Math.max(s + 1, e) * 10) / 10);
         setQuality("best");
+        if (v.qualityHint) {
+          toast({ title: "Fetched via the cookie-free relay", description: v.qualityHint });
+        }
       } catch {
         setInfoError({
           code: "network",
@@ -268,7 +308,7 @@ export default function Home() {
         setInfoLoading(false);
       }
     },
-    []
+    [toast]
   );
 
   const submitUrl = () => {
@@ -338,7 +378,7 @@ export default function Home() {
         toast({
           title: "Preview loaded from your browser",
           description:
-            "YouTube blocked the server from indexing this video. Scrub the player and set your crop times — cutting will retry through alternate clients.",
+            "YouTube blocked the server from indexing this video. Scrub the player and set your crop times — cutting will retry through the relay network.",
         });
         return;
       }
@@ -503,7 +543,7 @@ export default function Home() {
       if (ok) {
         setJob(data.job);
         if (data.job.status === "done") {
-          toast({ title: "Clip ready 🎬", description: "Your download is waiting below." });
+          toast({ title: "Clip ready 🎬", description: "Preview it right here, then download." });
           void refreshRecent();
         } else if (data.job.status === "error") {
           void refreshRecent();
@@ -513,74 +553,116 @@ export default function Home() {
     return () => clearInterval(iv);
   }, [job?.id, jobActive, job?.status, refreshRecent, toast]);
 
+  /* Cmd/Ctrl+Enter: submit the URL, or cut when the editor is live */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        if (info && !busyJob) void startClip();
+        else if (!infoLoading) submitUrl();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [info, busyJob, infoLoading, start, end, quality, precise, url]);
+
   /* ---------------- derived UI data ---------------- */
 
   const duration = info?.duration ?? 0;
   const clipLen = Math.max(0, end - start);
   const estMB = info ? estimateSizeMB(start, end, quality, info.qualities) : 0;
-  const topQualities = (info?.qualities ?? []).slice(0, 3);
   const selectedHeight = quality === "best" ? null : Number(quality);
   const isWebmPick = selectedHeight !== null && selectedHeight >= 1440;
   const clipInvalid = end <= start;
   const recentOthers = recent.filter((j) => j.id !== job?.id);
+  const qualityOptions = (info?.qualities ?? []).slice(0, 6);
+  const activeStage = job ? stageIndex(job.stage, job.status) : -1;
 
   return (
-    <div className="flex min-h-screen flex-col bg-background text-foreground">
-      {/* ambient glow */}
-      <div aria-hidden className="pointer-events-none fixed inset-x-0 top-0 h-72 bg-gradient-to-b from-red-500/10 via-orange-500/5 to-transparent" />
+    <div className="relative flex min-h-screen flex-col overflow-x-clip bg-background text-foreground">
+      {/* ambient background */}
+      <div aria-hidden className="pointer-events-none fixed inset-0 -z-10">
+        <div className="absolute inset-0 bg-[radial-gradient(60rem_32rem_at_15%_-5%,rgba(139,92,246,0.14),transparent),radial-gradient(48rem_30rem_at_85%_0%,rgba(217,70,239,0.10),transparent),radial-gradient(40rem_28rem_at_50%_110%,rgba(56,189,248,0.07),transparent)]" />
+        <div className="absolute inset-0 bg-[linear-gradient(to_right,rgba(255,255,255,0.025)_1px,transparent_1px),linear-gradient(to_bottom,rgba(255,255,255,0.025)_1px,transparent_1px)] bg-[size:56px_56px] [mask-image:radial-gradient(ellipse_at_center,black_30%,transparent_75%)]" />
+      </div>
 
       {/* header */}
-      <header className="sticky top-0 z-40 border-b bg-background/80 backdrop-blur">
-        <div className="mx-auto flex h-14 w-full max-w-5xl items-center justify-between px-4">
+      <header className="sticky top-0 z-40 border-b border-white/5 bg-background/70 backdrop-blur-xl">
+        <div className="mx-auto flex h-14 w-full max-w-6xl items-center justify-between px-4">
           <div className="flex items-center gap-2.5">
-            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-red-500 to-orange-500 shadow-sm">
-              <Scissors className="h-4.5 w-4.5 text-white" aria-hidden />
+            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-violet-500 via-fuchsia-500 to-orange-400 shadow-lg shadow-fuchsia-500/20">
+              <Scissors className="h-4 w-4 text-white" aria-hidden />
             </div>
             <span className="text-lg font-bold tracking-tight">fclip</span>
-            <Badge variant="outline" className="text-[10px] uppercase tracking-wide text-muted-foreground">
-              free · no login
+            <Badge variant="outline" className="hidden text-[10px] uppercase tracking-wide text-muted-foreground sm:inline-flex">
+              cookie-free cutting
             </Badge>
           </div>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setCookiesOpen(true)}
-            aria-label="Cookie settings"
-            className="gap-2"
-          >
-            <KeyRound className="h-4 w-4" aria-hidden />
-            <span className="hidden sm:inline">Cookies {cookiesPresent ? "· saved ✓" : ""}</span>
-          </Button>
+          <div className="flex items-center gap-1.5">
+            <span
+              className="mr-1 hidden items-center gap-1.5 text-xs text-muted-foreground sm:flex"
+              title={engineUp === null ? "Checking engine…" : engineUp ? "Engine healthy" : "Engine unreachable"}
+            >
+              <span
+                className={`h-2 w-2 rounded-full ${
+                  engineUp === null ? "animate-pulse bg-amber-400" : engineUp ? "bg-emerald-400 shadow-[0_0_8px] shadow-emerald-400/60" : "bg-red-500"
+                }`}
+              />
+              engine
+            </span>
+            <Button variant="ghost" size="sm" onClick={() => setDiagOpen(true)} className="gap-2">
+              <Activity className="h-4 w-4" aria-hidden />
+              <span className="hidden sm:inline">Diagnostics</span>
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => setCookiesOpen(true)} aria-label="Cookie settings" className="gap-2">
+              <KeyRound className="h-4 w-4" aria-hidden />
+              <span className="hidden sm:inline">Cookies{cookiesPresent ? " ✓" : ""}</span>
+            </Button>
+          </div>
         </div>
       </header>
 
       {/* main */}
-      <main className="relative mx-auto w-full max-w-5xl flex-1 px-4 pb-16 pt-10">
+      <main className="relative mx-auto w-full max-w-6xl flex-1 px-4 pb-16 pt-12">
         {/* hero */}
-        <section className="mb-8 text-center">
-          <h1 className="text-balance text-3xl font-extrabold tracking-tight sm:text-4xl">
-            Cut YouTube clips online — <span className="bg-gradient-to-r from-red-500 to-orange-500 bg-clip-text text-transparent">free & in up to 4K</span>
-          </h1>
-          <p className="mx-auto mt-3 max-w-2xl text-pretty text-sm leading-relaxed text-muted-foreground sm:text-base">
-            Paste a link, pick the exact seconds, download just that part. fclip fetches
-            <strong className="text-foreground"> only the byte-ranges it needs</strong> — a 30-second cut from a
-            4 GB 4K video transfers a fraction of the file. No account, no watermark.
-          </p>
-        </section>
+        <section className="mb-10 text-center">
+          <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
+            <Badge variant="outline" className="mb-4 gap-1.5 border-white/10 bg-white/5 px-3 py-1 text-xs text-muted-foreground">
+              <Zap className="h-3 w-3 text-fuchsia-400" aria-hidden />
+              yt-dlp + ffmpeg · byte-range cutting · up to 4K
+            </Badge>
+            <h1 className="text-balance text-4xl font-extrabold tracking-tight sm:text-5xl">
+              Cut YouTube clips,{" "}
+              <span className="bg-gradient-to-r from-violet-400 via-fuchsia-400 to-orange-300 bg-clip-text text-transparent">
+                no cookies needed
+              </span>
+            </h1>
+            <p className="mx-auto mt-4 max-w-2xl text-pretty text-sm leading-relaxed text-muted-foreground sm:text-base">
+              Paste a link, pick the exact seconds, download just that part. fclip streams
+              <strong className="text-foreground"> only the byte-ranges it needs</strong> and falls back to its
+              relay network when YouTube walls the server — an account is never required.
+            </p>
+          </motion.div>
 
-        {/* URL bar */}
-        <section aria-label="Video URL" className="mb-6">
-          <Card className="border-border/60 shadow-sm">
-            <CardContent className="p-4 sm:p-5">
-              <div className="flex flex-col gap-3 sm:flex-row">
+          {/* URL bar */}
+          <motion.section
+            aria-label="Video URL"
+            className="mx-auto mt-8 max-w-3xl"
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.45, delay: 0.08 }}
+          >
+            <div className="rounded-2xl border border-white/10 bg-white/[0.04] p-2 shadow-2xl shadow-black/40 backdrop-blur">
+              <div className="flex flex-col gap-2 sm:flex-row">
                 <div className="relative flex-1">
                   <Link2 className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
                   <Input
                     value={url}
                     onChange={(e) => setUrl(e.target.value)}
                     onKeyDown={(e) => e.key === "Enter" && !infoLoading && submitUrl()}
-                    placeholder="https://www.youtube.com/watch?v=…"
-                    className="h-11 pl-9 text-sm sm:text-base"
+                    placeholder="Paste a YouTube or direct video link…"
+                    className="h-12 border-transparent bg-transparent pl-9 text-sm focus-visible:ring-1 focus-visible:ring-fuchsia-500/40 sm:text-base"
                     aria-label="Video URL"
                     inputMode="url"
                     autoComplete="off"
@@ -591,32 +673,62 @@ export default function Home() {
                   <Button
                     onClick={submitUrl}
                     disabled={infoLoading}
-                    className="h-11 flex-1 gap-2 bg-gradient-to-r from-red-500 to-orange-500 text-white hover:opacity-90 sm:flex-none sm:px-6"
+                    className="h-12 flex-1 gap-2 bg-gradient-to-r from-violet-500 to-fuchsia-500 text-white shadow-lg shadow-fuchsia-500/25 hover:opacity-90 sm:flex-none sm:px-7"
                   >
                     {infoLoading ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Clapperboard className="h-4 w-4" aria-hidden />}
                     Fetch video
                   </Button>
-                  <Button onClick={loadDemo} disabled={infoLoading} variant="outline" className="h-11 gap-2">
+                  <Button onClick={loadDemo} disabled={infoLoading} variant="outline" className="h-12 gap-2 border-white/10 bg-white/5 hover:bg-white/10">
                     <FlaskConical className="h-4 w-4" aria-hidden />
                     Demo
                   </Button>
                 </div>
               </div>
-              <p className="mt-2.5 text-xs text-muted-foreground">
-                Works with youtube.com, youtu.be, Shorts, and any direct video URL — timestamps in the link
-                (<code className="rounded bg-muted px-1">&amp;t=90</code>) pre-fill the clip start.
-              </p>
-            </CardContent>
-          </Card>
+            </div>
+            <div className="mt-3 flex flex-wrap items-center justify-center gap-1.5 text-xs text-muted-foreground">
+              <span className="hidden sm:inline">Try:</span>
+              {SAMPLES.map((s) => (
+                <button
+                  key={s.url}
+                  type="button"
+                  onClick={() => {
+                    setUrl(s.url);
+                    void fetchInfoFor(s.url);
+                  }}
+                  className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 transition-colors hover:border-fuchsia-400/40 hover:bg-fuchsia-500/10 hover:text-foreground"
+                >
+                  {s.label}
+                </button>
+              ))}
+              <span className="ml-1 hidden md:inline">· timestamps in the link (<code className="rounded bg-muted px-1">&amp;t=90</code>) pre-fill the start</span>
+            </div>
+          </motion.section>
+
+          {/* steps */}
+          <div className="mx-auto mt-8 flex max-w-3xl flex-wrap items-center justify-center gap-x-8 gap-y-3 text-xs text-muted-foreground">
+            {[
+              { icon: MousePointerClick, text: "Paste the link" },
+              { icon: Gauge, text: "Drag the timeline, pick a quality" },
+              { icon: Download, text: "Download the clip" },
+            ].map((s, i) => (
+              <span key={s.text} className="inline-flex items-center gap-2">
+                <span className="flex h-6 w-6 items-center justify-center rounded-full border border-white/10 bg-white/5">
+                  <s.icon className="h-3 w-3 text-fuchsia-400" aria-hidden />
+                </span>
+                {s.text}
+                {i < 2 && <span className="ml-4 hidden text-white/20 sm:inline">→</span>}
+              </span>
+            ))}
+          </div>
         </section>
 
         {/* info error */}
         {infoError && (
-          <section className="mb-6" aria-live="polite">
-            <Alert className={infoError.code === "bot_check" ? "border-amber-500/50 bg-amber-500/10 text-amber-900 dark:text-amber-200" : "border-red-500/50 bg-red-500/10"}>
-              <TriangleAlert className="h-4 w-4" aria-hidden />
+          <motion.section initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="mx-auto mb-6 max-w-3xl" aria-live="polite">
+            <Alert className="border-amber-500/40 bg-amber-500/[0.07]">
+              <TriangleAlert className="h-4 w-4 text-amber-400" aria-hidden />
               <AlertTitle>
-                {infoError.code === "bot_check"
+                {infoError.code === "bot_check" || infoError.code === "no_formats"
                   ? "YouTube wants to verify this server"
                   : infoError.code === "engine_missing"
                     ? "This server can't run fclip"
@@ -637,15 +749,15 @@ export default function Home() {
                     </a>
                   </div>
                 )}
-                {infoError.code === "bot_check" && (
+                {(infoError.code === "bot_check" || infoError.code === "no_formats") && (
                   <div className="flex flex-wrap gap-2">
-                    <Button size="sm" onClick={() => setCookiesOpen(true)} className="gap-2 bg-gradient-to-r from-red-500 to-orange-500 text-white hover:opacity-90">
+                    <Button size="sm" onClick={() => setCookiesOpen(true)} className="gap-2 bg-gradient-to-r from-violet-500 to-fuchsia-500 text-white hover:opacity-90">
                       <KeyRound className="h-4 w-4" aria-hidden /> Add browser cookies
                     </Button>
-                    <Button size="sm" variant="outline" onClick={enterManualMode} className="gap-2">
+                    <Button size="sm" variant="outline" onClick={enterManualMode} className="gap-2 border-white/10 bg-white/5 hover:bg-white/10">
                       <PencilLine className="h-4 w-4" aria-hidden /> Enter times manually
                     </Button>
-                    <span className="py-1.5 text-xs text-muted-foreground">or try again — it can be a transient rate-limit.</span>
+                    <span className="py-1.5 text-xs text-muted-foreground">or try again — the relay network may pick it up.</span>
                   </div>
                 )}
               </AlertDescription>
@@ -653,7 +765,7 @@ export default function Home() {
 
             {/* The preview still streams from YouTube inside the browser even when the
                 server is bot-walled — attach the player so the crop tools can use it. */}
-            {infoError.code === "bot_check" && ytId && (
+            {(infoError.code === "bot_check" || infoError.code === "no_formats") && ytId && (
               <div className="mt-4 space-y-2">
                 <YtPlayer ref={playerRef} videoId={ytId} />
                 {fallbackPending && (
@@ -663,134 +775,191 @@ export default function Home() {
                 )}
               </div>
             )}
-          </section>
+          </motion.section>
         )}
 
         {/* loading skeleton */}
         {infoLoading && (
-          <section className="mb-6">
-            <Card><CardContent className="flex flex-col gap-4 p-4 sm:flex-row sm:p-6">
-              <Skeleton className="aspect-video w-full rounded-lg sm:w-80" />
-              <div className="flex-1 space-y-3">
-                <Skeleton className="h-6 w-3/4" />
-                <Skeleton className="h-4 w-1/2" />
-                <Skeleton className="h-4 w-1/3" />
-                <Skeleton className="h-9 w-full" />
-              </div>
-            </CardContent></Card>
+          <section className="mx-auto mb-6 max-w-3xl">
+            <Card className="border-white/10 bg-white/[0.03]">
+              <CardContent className="flex flex-col gap-4 p-4 sm:flex-row sm:p-6">
+                <Skeleton className="aspect-video w-full rounded-lg sm:w-80" />
+                <div className="flex-1 space-y-3">
+                  <Skeleton className="h-6 w-3/4" />
+                  <Skeleton className="h-4 w-1/2" />
+                  <Skeleton className="h-4 w-1/3" />
+                  <Skeleton className="h-9 w-full" />
+                </div>
+              </CardContent>
+            </Card>
           </section>
         )}
 
         {/* video info + editor */}
         {info && !infoLoading && (
-          <section className="mb-6 space-y-4">
-            <Card className="border-border/60 shadow-sm">
-              <CardContent className="p-4 sm:p-6">
-                <div className="grid gap-4 sm:grid-cols-[minmax(0,22rem)_1fr] sm:gap-6">
-                  {/* thumbnail */}
-                  <div className="relative aspect-video w-full overflow-hidden rounded-lg border bg-gradient-to-br from-red-500/15 to-orange-500/15">
-                    {info.thumbnail && !thumbError ? (
-                      <img
-                        src={info.thumbnail}
-                        alt={`Thumbnail of ${info.title}`}
-                        className="h-full w-full object-cover"
-                        onError={() => setThumbError(true)}
-                      />
-                    ) : (
-                      <div className="flex h-full w-full items-center justify-center">
-                        <Clapperboard className="h-10 w-10 text-muted-foreground" aria-hidden />
-                      </div>
-                    )}
-                    {!manualMode && (
-                      <Badge className="absolute bottom-2 right-2 bg-black/80 text-white tabular-nums">
-                        {fmtClock(info.duration)}
-                      </Badge>
-                    )}
-                  </div>
-                  {/* meta */}
-                  <div className="min-w-0">
-                    <h2 className="line-clamp-2 text-base font-semibold leading-snug sm:text-lg">{info.title}</h2>
-                    <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground sm:text-sm">
-                      {info.channel && (
-                        <span className="inline-flex items-center gap-1.5">
-                          <UserRound className="h-3.5 w-3.5" aria-hidden /> {info.channel}
-                        </span>
-                      )}
-                      {info.viewCount != null && (
-                        <span className="inline-flex items-center gap-1.5">
-                          <Eye className="h-3.5 w-3.5" aria-hidden /> {info.viewCount.toLocaleString()} views
-                        </span>
-                      )}
-                      {info.uploadDate && (
-                        <span className="inline-flex items-center gap-1.5">
-                          <CalendarDays className="h-3.5 w-3.5" aria-hidden /> {info.uploadDate.slice(0, 4)}-{info.uploadDate.slice(4, 6)}-{info.uploadDate.slice(6, 8)}
-                        </span>
+          <motion.section
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.35 }}
+            className="grid items-start gap-4 lg:grid-cols-[1fr_360px]"
+          >
+            {/* left: player + timeline */}
+            <div className="space-y-4">
+              <Card className="border-white/10 bg-white/[0.03]">
+                <CardContent className="p-3 sm:p-4">
+                  {ytId && !manualMode ? (
+                    <YtPlayer ref={playerRef} videoId={ytId} />
+                  ) : (
+                    <div className="relative aspect-video w-full overflow-hidden rounded-lg border border-white/10 bg-gradient-to-br from-violet-500/15 to-fuchsia-500/10">
+                      {info.thumbnail && !thumbError ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={info.thumbnail}
+                          alt={`Thumbnail of ${info.title}`}
+                          className="h-full w-full object-cover"
+                          onError={() => setThumbError(true)}
+                        />
+                      ) : (
+                        <div className="flex h-full w-full items-center justify-center">
+                          <Clapperboard className="h-10 w-10 text-muted-foreground" aria-hidden />
+                        </div>
                       )}
                     </div>
-                    {topQualities.length > 0 && (
-                      <div className="mt-3 flex flex-wrap items-center gap-1.5">
-                        <span className="text-xs text-muted-foreground">Available:</span>
-                        {topQualities.map((q) => (
-                          <Badge key={q.height} variant="outline" className="tabular-nums">
-                            {q.height}p{q.height >= 2160 ? " · 4K" : q.height >= 1440 ? " · 2K" : ""}
-                          </Badge>
+                  )}
+
+                  <div className="mt-3 flex flex-wrap items-start justify-between gap-2 px-1">
+                    <div className="min-w-0">
+                      <h2 className="line-clamp-2 text-base font-semibold leading-snug sm:text-lg">{info.title}</h2>
+                      <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                        {info.channel && (
+                          <span className="inline-flex items-center gap-1.5">
+                            <UserRound className="h-3.5 w-3.5" aria-hidden /> {info.channel}
+                          </span>
+                        )}
+                        {info.viewCount != null && (
+                          <span className="inline-flex items-center gap-1.5">
+                            <Eye className="h-3.5 w-3.5" aria-hidden /> {info.viewCount.toLocaleString()} views
+                          </span>
+                        )}
+                        {info.uploadDate && (
+                          <span className="inline-flex items-center gap-1.5">
+                            <CalendarDays className="h-3.5 w-3.5" aria-hidden /> {info.uploadDate.slice(0, 4)}-{info.uploadDate.slice(4, 6)}-{info.uploadDate.slice(6, 8)}
+                          </span>
+                        )}
+                        {!manualMode && (
+                          <span className="inline-flex items-center gap-1.5 tabular-nums">
+                            <Timer className="h-3.5 w-3.5" aria-hidden /> {fmtClock(info.duration)}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {info.chapters && info.chapters.length > 0 && (
+                    <div className="mt-3 px-1">
+                      <p className="mb-1.5 text-xs text-muted-foreground">Chapters — tap to load one into the cutter:</p>
+                      <div className="flex max-h-24 flex-wrap gap-1.5 overflow-y-auto pr-1">
+                        {info.chapters.slice(0, 14).map((c, i) => (
+                          <button
+                            key={i}
+                            type="button"
+                            onClick={() => applyRange(c.start, Math.min(c.end, duration))}
+                            className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-xs transition-colors hover:border-fuchsia-400/40 hover:bg-fuchsia-500/10"
+                            title={`${fmtClock(c.start)} → ${fmtClock(c.end)}`}
+                          >
+                            {c.title} <span className="tabular-nums text-muted-foreground">{fmtClock(c.start)}</span>
+                          </button>
                         ))}
                       </div>
-                    )}
-                    {info.chapters && info.chapters.length > 0 && (
-                      <div className="mt-3">
-                        <p className="mb-1.5 text-xs text-muted-foreground">Chapters — tap to load one into the cutter:</p>
-                        <div className="flex max-h-24 flex-wrap gap-1.5 overflow-y-auto pr-1">
-                          {info.chapters.slice(0, 14).map((c, i) => (
-                            <button
-                              key={i}
-                              type="button"
-                              onClick={() => applyRange(c.start, Math.min(c.end, duration))}
-                              className="rounded-full border px-2.5 py-1 text-xs transition-colors hover:border-red-400 hover:bg-red-500/10"
-                              title={`${fmtClock(c.start)} → ${fmtClock(c.end)}`}
-                            >
-                              {c.title} <span className="tabular-nums text-muted-foreground">{fmtClock(c.start)}</span>
-                            </button>
-                          ))}
-                        </div>
+                    </div>
+                  )}
+
+                  {serverBlocked && (
+                    <Alert className="mt-3 border-amber-500/40 bg-amber-500/[0.07]">
+                      <TriangleAlert className="h-4 w-4 text-amber-400" aria-hidden />
+                      <AlertDescription className="text-xs leading-relaxed">
+                        Preview &amp; times come straight from your browser. Cutting will auto-retry through
+                        alternate clients and the cookie-free relay network.
+                      </AlertDescription>
+                    </Alert>
+                  )}
+
+                  {info.isLive && (
+                    <Alert className="mt-3 border-amber-500/40 bg-amber-500/[0.07]">
+                      <TriangleAlert className="h-4 w-4 text-amber-400" aria-hidden />
+                      <AlertDescription className="text-xs">
+                        This is a live stream — fclip can only cut finished videos.
+                      </AlertDescription>
+                    </Alert>
+                  )}
+
+                  {info.qualityHint && (
+                    <p className="mt-3 rounded-lg border border-fuchsia-500/30 bg-fuchsia-500/[0.08] px-3 py-2 text-xs leading-relaxed text-fuchsia-300">
+                      <Wand2 className="mr-1 inline h-3.5 w-3.5" aria-hidden /> {info.qualityHint}
+                    </p>
+                  )}
+                </CardContent>
+              </Card>
+
+              <Card className="border-white/10 bg-white/[0.03]">
+                <CardContent className="space-y-4 p-3 sm:p-4">
+                  {!manualMode && (
+                    <Timeline
+                      duration={duration || 60}
+                      start={start}
+                      end={end}
+                      chapters={info.chapters}
+                      onChange={applyRange}
+                    />
+                  )}
+
+                  <div className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end">
+                    <div>
+                      <label htmlFor="clip-start" className="mb-1.5 block text-xs font-medium text-muted-foreground">Start</label>
+                      <Input
+                        id="clip-start"
+                        value={startText}
+                        onChange={(e) => setStartText(e.target.value)}
+                        onBlur={() => commitTime("start")}
+                        onKeyDown={(e) => e.key === "Enter" && commitTime("start")}
+                        className="h-10 border-white/10 bg-white/5 font-mono tabular-nums"
+                        inputMode="numeric"
+                        aria-describedby="clip-length-hint"
+                      />
+                    </div>
+                    <div>
+                      <label htmlFor="clip-end" className="mb-1.5 block text-xs font-medium text-muted-foreground">End</label>
+                      <Input
+                        id="clip-end"
+                        value={endText}
+                        onChange={(e) => setEndText(e.target.value)}
+                        onBlur={() => commitTime("end")}
+                        onKeyDown={(e) => e.key === "Enter" && commitTime("end")}
+                        className="h-10 border-white/10 bg-white/5 font-mono tabular-nums"
+                        inputMode="numeric"
+                      />
+                    </div>
+                    <div id="clip-length-hint" className="flex items-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2">
+                      <div>
+                        <p className="text-[11px] text-muted-foreground">Selected</p>
+                        <p className="text-sm font-semibold tabular-nums">
+                          {fmtClock(clipLen)} <span className="font-normal text-muted-foreground">· ≈ {estMB} MB</span>
+                        </p>
                       </div>
-                    )}
-                    {info.isLive && (
-                      <Alert className="mt-3 border-amber-500/50 bg-amber-500/10">
-                        <TriangleAlert className="h-4 w-4" aria-hidden />
-                        <AlertDescription className="text-xs">
-                          This is a live stream — fclip can only cut finished videos.
-                        </AlertDescription>
-                      </Alert>
-                    )}
+                    </div>
                   </div>
-                </div>
-              </CardContent>
-            </Card>
+                  <p className="-mt-1 text-xs text-muted-foreground">
+                    Accepts <code className="rounded bg-muted px-1">90</code>, <code className="rounded bg-muted px-1">1:30</code> or{" "}
+                    <code className="rounded bg-muted px-1">2:20:00</code> (h:mm:ss).
+                  </p>
 
-            {/* clip editor */}
-            <Card className="border-border/60 shadow-sm">
-              <CardContent className="space-y-5 p-4 sm:p-6">
-                {serverBlocked && (
-                  <Alert className="border-amber-500/50 bg-amber-500/10">
-                    <TriangleAlert className="h-4 w-4" aria-hidden />
-                    <AlertDescription className="text-xs leading-relaxed">
-                      Preview &amp; times come straight from your browser. The server itself is blocked by YouTube
-                      from indexing this video, so cutting will auto-retry with alternate clients — if it still
-                      fails, add cookies in Settings or run fclip on your own machine.
-                    </AlertDescription>
-                  </Alert>
-                )}
-
-                {ytId && !manualMode && (
-                  <div className="space-y-2">
-                    <YtPlayer ref={playerRef} videoId={ytId} />
+                  {ytId && !manualMode && (
                     <div className="flex flex-wrap gap-2">
-                      <Button type="button" variant="outline" size="sm" onClick={() => grabPlayerTime("start")} className="gap-1.5">
-                        <Timer className="h-3.5 w-3.5 text-red-500" aria-hidden /> Set start to player time
+                      <Button type="button" variant="outline" size="sm" onClick={() => grabPlayerTime("start")} className="gap-1.5 border-white/10 bg-white/5 hover:bg-white/10">
+                        <Timer className="h-3.5 w-3.5 text-violet-400" aria-hidden /> Start = player time
                       </Button>
-                      <Button type="button" variant="outline" size="sm" onClick={() => grabPlayerTime("end")} className="gap-1.5">
-                        <Timer className="h-3.5 w-3.5 text-orange-500" aria-hidden /> Set end to player time
+                      <Button type="button" variant="outline" size="sm" onClick={() => grabPlayerTime("end")} className="gap-1.5 border-white/10 bg-white/5 hover:bg-white/10">
+                        <Timer className="h-3.5 w-3.5 text-fuchsia-400" aria-hidden /> End = player time
                       </Button>
                       <Button
                         type="button"
@@ -798,108 +967,63 @@ export default function Home() {
                         size="sm"
                         onClick={() => setPreviewing((v) => !v)}
                         disabled={previewing ? false : !info || end <= start}
-                        className="gap-1.5"
+                        className="gap-1.5 border-white/10 bg-white/5 hover:bg-white/10"
                       >
-                        {previewing ? <Square className="h-3.5 w-3.5 text-foreground" aria-hidden /> : <Play className="h-3.5 w-3.5 text-emerald-500" aria-hidden />}
+                        {previewing ? <Square className="h-3.5 w-3.5" aria-hidden /> : <Play className="h-3.5 w-3.5 text-emerald-400" aria-hidden />}
                         {previewing ? "Stop preview" : "Preview selection"}
                       </Button>
-                      <span className="py-1 text-xs text-muted-foreground">Scrub the video above, then grab the exact second here.</span>
                     </div>
-                  </div>
-                )}
+                  )}
+                </CardContent>
+              </Card>
+            </div>
 
-                {!manualMode && (
-                  <Timeline
-                    duration={duration || 60}
-                    start={start}
-                    end={end}
-                    chapters={info.chapters}
-                    onChange={applyRange}
-                  />
-                )}
-
-                {/* precise time inputs */}
-                <div className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end">
-                  <div>
-                    <label htmlFor="clip-start" className="mb-1.5 block text-xs font-medium text-muted-foreground">Start</label>
-                    <Input
-                      id="clip-start"
-                      value={startText}
-                      onChange={(e) => setStartText(e.target.value)}
-                      onBlur={() => commitTime("start")}
-                      onKeyDown={(e) => e.key === "Enter" && commitTime("start")}
-                      className="h-10 font-mono tabular-nums"
-                      inputMode="numeric"
-                      aria-describedby="clip-length-hint"
-                    />
-                  </div>
-                  <div>
-                    <label htmlFor="clip-end" className="mb-1.5 block text-xs font-medium text-muted-foreground">End</label>
-                    <Input
-                      id="clip-end"
-                      value={endText}
-                      onChange={(e) => setEndText(e.target.value)}
-                      onBlur={() => commitTime("end")}
-                      onKeyDown={(e) => e.key === "Enter" && commitTime("end")}
-                      className="h-10 font-mono tabular-nums"
-                      inputMode="numeric"
-                    />
-                  </div>
-                  <div id="clip-length-hint" className="flex items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2 sm:mb-0">
-                    <div>
-                      <p className="text-xs text-muted-foreground">Selected</p>
-                      <p className="text-sm font-semibold tabular-nums">
-                        {fmtClock(clipLen)} <span className="font-normal text-muted-foreground">· ≈ {estMB} MB</span>
-                      </p>
-                    </div>
-                  </div>
-                </div>
-
-                <p className="-mt-1 text-xs text-muted-foreground">
-                  Accepts <code className="rounded bg-muted px-1">90</code>, <code className="rounded bg-muted px-1">1:30</code> or{" "}
-                  <code className="rounded bg-muted px-1">2:20:00</code> (h:mm:ss).
-                </p>
-
-                {clipInvalid && (
-                  <p className="text-xs text-red-500">The end time must be after the start time.</p>
-                )}
-
-                {info.qualityHint && (
-                  <p className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-                    {info.qualityHint}
-                  </p>
-                )}
-
-                {/* quality + precision */}
-                <div className="grid gap-4 sm:grid-cols-2">
+            {/* right: controls */}
+            <div className="space-y-4 lg:sticky lg:top-20">
+              <Card className="border-white/10 bg-white/[0.03]">
+                <CardContent className="space-y-4 p-4">
                   <div className="space-y-1.5">
                     <label className="text-xs font-medium text-muted-foreground">Quality</label>
-                    <Select value={quality} onValueChange={setQuality}>
-                      <SelectTrigger className="h-10 w-full" aria-label="Clip quality">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="best">Best available</SelectItem>
-                        {(info.qualities ?? []).map((q) => (
-                          <SelectItem key={q.height} value={String(q.height)}>
-                            {q.height}p{q.height >= 2160 ? " (4K)" : q.height >= 1440 ? " (2K)" : ""}
-                            {q.ext === "webm" ? " · VP9" : ""}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    {info.qualities.length === 0 && (
-                      <p className="text-xs text-muted-foreground">Only &ldquo;best&rdquo; is offered for this source.</p>
+                    <div className="flex flex-wrap gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setQuality("best")}
+                        className={`rounded-lg border px-3 py-1.5 text-xs font-medium transition-all ${
+                          quality === "best"
+                            ? "border-transparent bg-gradient-to-r from-violet-500 to-fuchsia-500 text-white shadow-md shadow-fuchsia-500/20"
+                            : "border-white/10 bg-white/5 text-muted-foreground hover:bg-white/10"
+                        }`}
+                      >
+                        Best
+                      </button>
+                      {qualityOptions.map((q) => (
+                        <button
+                          key={q.height}
+                          type="button"
+                          onClick={() => setQuality(String(q.height))}
+                          className={`rounded-lg border px-3 py-1.5 text-xs font-medium tabular-nums transition-all ${
+                            quality === String(q.height)
+                              ? "border-transparent bg-gradient-to-r from-violet-500 to-fuchsia-500 text-white shadow-md shadow-fuchsia-500/20"
+                              : "border-white/10 bg-white/5 text-muted-foreground hover:bg-white/10"
+                          }`}
+                        >
+                          {qualityLabel(q.height)}
+                        </button>
+                      ))}
+                    </div>
+                    {qualityOptions.length === 0 && (
+                      <p className="text-xs text-muted-foreground">Only “best” is offered for this source.</p>
                     )}
                     {isWebmPick && (
-                      <p className="text-xs text-amber-600 dark:text-amber-400">
-                        2K/4K on YouTube use VP9 (webm) — plays in browsers & VLC. Pick 1080p for classic MP4 (H.264).
+                      <p className="text-xs text-amber-400">
+                        2K/4K on YouTube use VP9 (webm) — plays in browsers &amp; VLC. Pick 1080p for classic MP4 (H.264).
                       </p>
                     )}
                   </div>
+
                   <div className="space-y-1.5">
                     <label htmlFor="precise-switch" className="text-xs font-medium text-muted-foreground">Cut precision</label>
-                    <div className="flex h-10 items-center gap-3 rounded-lg border px-3">
+                    <div className="flex h-10 items-center gap-3 rounded-lg border border-white/10 bg-white/5 px-3">
                       <Switch id="precise-switch" checked={precise} onCheckedChange={setPrecise} />
                       <span className="text-sm">{precise ? "Frame-accurate" : "Fast (keyframe-aligned)"}</span>
                     </div>
@@ -909,39 +1033,63 @@ export default function Home() {
                         : "Snaps to the nearest keyframe (±2 s) — instant, no re-encoding."}
                     </p>
                   </div>
-                </div>
 
-                {/* CTA */}
-                <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:justify-between">
-                  <p className="text-xs text-muted-foreground sm:max-w-sm">
-                    fclip streams only the fragments covering {fmtClock(start)} → {fmtClock(end)} — it never
-                    pulls the full {fmtClock(duration)} file.
-                  </p>
+                  {clipInvalid && (
+                    <p className="text-xs text-red-500">The end time must be after the start time.</p>
+                  )}
+
                   <Button
                     onClick={startClip}
                     disabled={clipInvalid || info.isLive || !!busyJob || startingClip}
-                    className="h-11 gap-2 bg-gradient-to-r from-red-500 to-orange-500 text-white hover:opacity-90"
+                    className="h-12 w-full gap-2 bg-gradient-to-r from-violet-500 to-fuchsia-500 text-base text-white shadow-lg shadow-fuchsia-500/25 hover:opacity-90"
                   >
                     {busyJob || startingClip ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Scissors className="h-4 w-4" aria-hidden />}
                     {busyJob ? "Cutting…" : "Cut & download clip"}
                   </Button>
-                </div>
-              </CardContent>
-            </Card>
-          </section>
+                  <p className="text-center text-[11px] leading-relaxed text-muted-foreground">
+                    Streams only the fragments covering {fmtClock(start)} → {fmtClock(end)} — never the full{" "}
+                    {fmtClock(duration)} file. <kbd className="rounded bg-muted px-1">⌘/Ctrl</kbd>+
+                    <kbd className="rounded bg-muted px-1">↵</kbd> works too.
+                  </p>
+                </CardContent>
+              </Card>
+
+              <Card className="hidden border-white/10 bg-white/[0.03] lg:block">
+                <CardContent className="p-4">
+                  <p className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    <ListVideo className="h-3.5 w-3.5" aria-hidden /> How the pipeline picks a route
+                  </p>
+                  <ol className="space-y-1.5 text-xs leading-relaxed text-muted-foreground">
+                    <li><strong className="text-foreground">1 · Direct</strong> — yt-dlp with BotGuard PO tokens, no cookies.</li>
+                    <li><strong className="text-foreground">2 · Storm</strong> — parallel player-identity bursts until one gets through.</li>
+                    <li><strong className="text-foreground">3 · Relay</strong> — public Piped/Invidious instances fetch &amp; proxy the bytes.</li>
+                    <li><strong className="text-foreground">Cookies</strong> — optional booster, never a requirement.</li>
+                  </ol>
+                </CardContent>
+              </Card>
+            </div>
+          </motion.section>
         )}
 
         {/* active job */}
         {job && (
-          <section className="mb-6" aria-live="polite">
-            <Card className={job.status === "error" ? "border-red-500/40" : job.status === "done" ? "border-emerald-500/40" : "border-border/60"}>
-              <CardContent className="space-y-3 p-4 sm:p-6">
+          <motion.section initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} className="mx-auto mb-6 mt-4 max-w-3xl" aria-live="polite">
+            <Card
+              className={
+                job.status === "error"
+                  ? "border-red-500/40 bg-red-500/[0.04]"
+                  : job.status === "done"
+                    ? "border-emerald-500/40 bg-emerald-500/[0.04]"
+                    : "border-white/10 bg-white/[0.03]"
+              }
+            >
+              <CardContent className="space-y-3 p-4 sm:p-5">
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <p className="flex items-center gap-2 text-sm font-semibold">
-                      {job.status === "done" && <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-500" aria-hidden />}
-                      {job.status === "error" && <XCircle className="h-4 w-4 shrink-0 text-red-500" aria-hidden />}
-                      {busyJob && <Loader2 className="h-4 w-4 shrink-0 animate-spin text-red-500" aria-hidden />}
+                      {job.status === "done" && <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-400" aria-hidden />}
+                      {job.status === "error" && <XCircle className="h-4 w-4 shrink-0 text-red-400" aria-hidden />}
+                      {busyJob && <Loader2 className="h-4 w-4 shrink-0 animate-spin text-fuchsia-400" aria-hidden />}
                       <span className="truncate">
                         {job.status === "done" ? "Clip ready" : job.status === "error" ? "Clip failed" : job.stage}
                       </span>
@@ -957,31 +1105,62 @@ export default function Home() {
                   </Button>
                 </div>
 
+                {/* stage tracker */}
+                {job.status !== "error" && (
+                  <div className="flex items-center gap-1.5">
+                    {STAGES.map((s, i) => {
+                      const state = i < activeStage ? "done" : i === activeStage ? "active" : "todo";
+                      return (
+                        <div key={s} className="flex flex-1 flex-col gap-1">
+                          <div
+                            className={`h-1 rounded-full transition-colors duration-500 ${
+                              state === "done"
+                                ? "bg-emerald-400"
+                                : state === "active"
+                                  ? "bg-gradient-to-r from-violet-500 to-fuchsia-500"
+                                  : "bg-white/10"
+                            }`}
+                          />
+                          <span className={`text-[10px] ${state === "todo" ? "text-muted-foreground/60" : "text-foreground"}`}>{s}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
                 {busyJob && (
                   <div className="space-y-1">
-                    <Progress value={job.progress >= 0 ? job.progress : undefined} className="h-2.5" />
+                    <Progress value={job.progress >= 0 ? job.progress : undefined} className="h-2" />
                     <p className="text-xs tabular-nums text-muted-foreground">
-                      {job.progress >= 0 ? `${job.progress.toFixed(0)}%` : "working…"} — downloading only the needed ranges
+                      {job.progress >= 0 ? `${job.progress.toFixed(0)}%` : "working…"} — fetching only the needed ranges
                     </p>
                   </div>
                 )}
 
                 {job.status === "error" && job.error && (
-                  <p className="text-sm text-red-500">{job.error}</p>
+                  <p className="text-sm text-red-400">{job.error}</p>
                 )}
 
                 {job.status === "done" && (
-                  <div className="flex flex-col gap-3 rounded-lg border bg-muted/30 p-3 sm:flex-row sm:items-center sm:justify-between">
-                    <div className="min-w-0 text-sm">
-                      <p className="truncate font-medium">{job.filename}</p>
-                      <p className="text-xs tabular-nums text-muted-foreground">
-                        {fmtBytes(job.filesize)}
-                        {job.clipDuration ? ` · ${fmtClock(job.clipDuration)}` : ""} · saved for 2 hours
-                      </p>
-                    </div>
-                    <div className="flex shrink-0 gap-2">
-                      <a href={`/api/clip/file?jobId=${job.id}`} download>
-                        <Button className="gap-2 bg-gradient-to-r from-red-500 to-orange-500 text-white hover:opacity-90">
+                  <div className="space-y-3">
+                    <video
+                      key={job.id}
+                      controls
+                      playsInline
+                      preload="metadata"
+                      className="max-h-[420px] w-full rounded-lg border border-white/10 bg-black"
+                      src={`/api/clip/file?jobId=${job.id}&inline=1`}
+                    />
+                    <div className="flex flex-col gap-3 rounded-lg border border-white/10 bg-white/5 p-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="min-w-0 text-sm">
+                        <p className="truncate font-medium">{job.filename}</p>
+                        <p className="text-xs tabular-nums text-muted-foreground">
+                          {fmtBytes(job.filesize)}
+                          {job.clipDuration ? ` · ${fmtClock(job.clipDuration)}` : ""} · saved for 2 hours
+                        </p>
+                      </div>
+                      <a href={`/api/clip/file?jobId=${job.id}`} download className="shrink-0">
+                        <Button className="gap-2 bg-gradient-to-r from-violet-500 to-fuchsia-500 text-white shadow-lg shadow-fuchsia-500/25 hover:opacity-90">
                           <Download className="h-4 w-4" aria-hidden /> Download clip
                         </Button>
                       </a>
@@ -994,24 +1173,24 @@ export default function Home() {
                     <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
                       Processing log ({job.logTail.length} lines)
                     </summary>
-                    <pre className="mt-2 max-h-40 overflow-y-auto rounded-md border bg-muted/40 p-2.5 font-mono text-[11px] leading-relaxed text-muted-foreground">
+                    <pre className="mt-2 max-h-40 overflow-y-auto rounded-md border border-white/10 bg-black/40 p-2.5 font-mono text-[11px] leading-relaxed text-muted-foreground">
                       {job.logTail.join("\n")}
                     </pre>
                   </details>
                 )}
               </CardContent>
             </Card>
-          </section>
+          </motion.section>
         )}
 
         {/* recent clips */}
         {recentOthers.length > 0 && (
-          <section className="mb-6">
+          <section className="mx-auto mb-8 mt-4 max-w-3xl">
             <h2 className="mb-2 text-sm font-semibold text-muted-foreground">Recent clips (this session)</h2>
-            <Card>
+            <Card className="border-white/10 bg-white/[0.03]">
               <CardContent className="max-h-72 space-y-2 overflow-y-auto p-3">
                 {recentOthers.map((j) => (
-                  <div key={j.id} className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2">
+                  <div key={j.id} className="flex items-center justify-between gap-3 rounded-lg border border-white/10 bg-white/[0.02] px-3 py-2">
                     <div className="min-w-0">
                       <p className="truncate text-sm font-medium">{j.title}</p>
                       <p className="text-xs tabular-nums text-muted-foreground">
@@ -1019,12 +1198,12 @@ export default function Home() {
                         <span
                           className={
                             j.status === "done"
-                              ? "text-emerald-500"
+                              ? "text-emerald-400"
                               : j.status === "error"
-                              ? "text-red-500"
-                              : j.status === "canceled"
-                              ? "text-muted-foreground"
-                              : "text-amber-500"
+                                ? "text-red-400"
+                                : j.status === "canceled"
+                                  ? "text-muted-foreground"
+                                  : "text-amber-400"
                           }
                         >
                           {j.status}
@@ -1034,7 +1213,7 @@ export default function Home() {
                     <div className="flex shrink-0 items-center gap-1">
                       {j.status === "done" && (
                         <a href={`/api/clip/file?jobId=${j.id}`} download aria-label={`Download ${j.title} clip`}>
-                          <Button variant="outline" size="icon" className="h-8 w-8">
+                          <Button variant="outline" size="icon" className="h-8 w-8 border-white/10 bg-white/5 hover:bg-white/10">
                             <Download className="h-4 w-4" aria-hidden />
                           </Button>
                         </a>
@@ -1050,18 +1229,18 @@ export default function Home() {
           </section>
         )}
 
-        {/* how it works */}
-        <section className="mb-6">
-          <h2 className="mb-3 text-lg font-bold">How fclip works</h2>
+        {/* features */}
+        <section className="mx-auto mb-6 mt-10 max-w-4xl">
+          <h2 className="mb-4 text-center text-lg font-bold">Why fclip</h2>
           <div className="grid gap-3 sm:grid-cols-3">
             {[
-              { icon: Link2, title: "1 · Paste the link", text: "Any YouTube video, Shorts link, or direct video URL. Timestamped links pre-fill the start point." },
-              { icon: SlidersHorizontal, title: "2 · Pick seconds & quality", text: "Drag the timeline or use the built-in player to grab exact times — up to 2160p (4K) where available." },
-              { icon: Download, title: "3 · Download the clip", text: "yt-dlp fetches only the needed byte-ranges, ffmpeg trims & muxes, and your clip is ready — no watermark." },
+              { icon: Zap, title: "Byte-range cutting", text: "A 30-second cut from a 4 GB 4K video transfers a fraction of the file — yt-dlp seeks straight into the stream." },
+              { icon: Wand2, title: "Cookie-free by design", text: "PO-token sessions, client storms and a relay network get clips through without any YouTube login." },
+              { icon: Gauge, title: "Original quality", text: "Up to 2160p with zero re-encoding — fast cuts are keyframe-snapped stream copies." },
             ].map((s) => (
-              <Card key={s.title} className="border-border/60">
+              <Card key={s.title} className="border-white/10 bg-white/[0.03]">
                 <CardContent className="p-4">
-                  <s.icon className="mb-2 h-5 w-5 text-red-500" aria-hidden />
+                  <s.icon className="mb-2 h-5 w-5 text-fuchsia-400" aria-hidden />
                   <h3 className="mb-1 text-sm font-semibold">{s.title}</h3>
                   <p className="text-xs leading-relaxed text-muted-foreground">{s.text}</p>
                 </CardContent>
@@ -1071,10 +1250,10 @@ export default function Home() {
         </section>
 
         {/* FAQ */}
-        <section>
+        <section className="mx-auto max-w-3xl">
           <h2 className="mb-3 text-lg font-bold">FAQ</h2>
-          <Accordion type="single" collapsible className="rounded-lg border bg-card">
-            <AccordionItem value="q1" className="border-b px-4 last:border-b-0">
+          <Accordion type="single" collapsible className="rounded-xl border border-white/10 bg-card">
+            <AccordionItem value="q1" className="border-b border-white/5 px-4 last:border-b-0">
               <AccordionTrigger className="text-sm">Is fclip really free?</AccordionTrigger>
               <AccordionContent className="text-sm leading-relaxed text-muted-foreground">
                 Yes — no account, no watermark, no per-clip limits. fclip is a self-hostable web app built on
@@ -1083,7 +1262,17 @@ export default function Home() {
                 machine keeps everything free and private.
               </AccordionContent>
             </AccordionItem>
-            <AccordionItem value="q2" className="border-b px-4 last:border-b-0">
+            <AccordionItem value="q2" className="border-b border-white/5 px-4 last:border-b-0">
+              <AccordionTrigger className="text-sm">How does it work without cookies?</AccordionTrigger>
+              <AccordionContent className="text-sm leading-relaxed text-muted-foreground">
+                Three independent routes, tried in order: (1) yt-dlp with automatically minted BotGuard
+                proof-of-origin tokens; (2) a parallel &ldquo;storm&rdquo; of YouTube player identities until one
+                breaks through the bot wall; (3) a relay network of public Piped/Invidious instances that fetch
+                and proxy the media through their own IPs. Cookies are an optional booster for edge cases
+                (private or age-restricted videos) — never a requirement.
+              </AccordionContent>
+            </AccordionItem>
+            <AccordionItem value="q3" className="border-b border-white/5 px-4 last:border-b-0">
               <AccordionTrigger className="text-sm">How can it cut 4K without downloading the whole 4 GB file?</AccordionTrigger>
               <AccordionContent className="text-sm leading-relaxed text-muted-foreground">
                 Modern video streams are split into small segments that players request over HTTP. yt-dlp
@@ -1091,14 +1280,6 @@ export default function Home() {
                 selected seconds (plus a little padding to the previous keyframe), then ffmpeg trims and
                 remuxes locally. A 30-second 4K cut typically transfers a few hundred megabytes instead of
                 gigabytes.
-              </AccordionContent>
-            </AccordionItem>
-            <AccordionItem value="q3" className="border-b px-4 last:border-b-0">
-              <AccordionTrigger className="text-sm">Why does YouTube sometimes ask for cookies?</AccordionTrigger>
-              <AccordionContent className="text-sm leading-relaxed text-muted-foreground">
-                YouTube aggressively rate-limits cloud and datacenter IPs with a &ldquo;confirm you&rsquo;re not a
-                bot&rdquo; wall. Adding your browser cookies (the official yt-dlp recommendation) or running
-                fclip on your own machine both fix it. The Cookies button in the header walks you through it.
               </AccordionContent>
             </AccordionItem>
             <AccordionItem value="q4" className="px-4">
@@ -1114,10 +1295,10 @@ export default function Home() {
       </main>
 
       {/* footer */}
-      <footer className="mt-auto border-t bg-background">
-        <div className="mx-auto flex w-full max-w-5xl flex-col items-center justify-between gap-2 px-4 py-4 pb-[max(1rem,env(safe-area-inset-bottom))] text-center text-xs text-muted-foreground sm:flex-row sm:text-left">
+      <footer className="mt-auto border-t border-white/5 bg-background/60">
+        <div className="mx-auto flex w-full max-w-6xl flex-col items-center justify-between gap-2 px-4 py-4 pb-[max(1rem,env(safe-area-inset-bottom))] text-center text-xs text-muted-foreground sm:flex-row sm:text-left">
           <p className="flex items-center gap-1.5">
-            <ShieldCheck className="h-3.5 w-3.5 text-emerald-500" aria-hidden />
+            <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" aria-hidden />
             Use only with content you own or that is licensed for reuse — respect creators&rsquo; rights and
             YouTube&rsquo;s Terms of Service.
           </p>
@@ -1141,6 +1322,20 @@ export default function Home() {
           toast({ title: "Cookies removed" });
         }}
       />
+
+      <Dialog open={diagOpen} onOpenChange={setDiagOpen}>
+        <DialogContent className="border-white/10 bg-background/95 sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Activity className="h-4 w-4 text-fuchsia-400" aria-hidden /> Engine diagnostics
+            </DialogTitle>
+            <DialogDescription className="text-xs">
+              Live status of the cutting pipeline — cookie names are never shown, only health.
+            </DialogDescription>
+          </DialogHeader>
+          <DiagPanel open={diagOpen} />
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

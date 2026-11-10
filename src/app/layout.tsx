@@ -14,16 +14,27 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "fclip — Free Online Video Clipper (up to 4K)",
+  title: "fclip — Cut YouTube Clips Online, No Cookies Needed (up to 4K)",
   description:
-    "Paste a YouTube link, pick the exact seconds, and download just that clip in up to 4K — free, no account, no watermark. fclip streams only the byte-ranges it needs, never the whole file.",
-  keywords: ["fclip", "video clipper", "YouTube cutter", "trim video online", "yt-dlp", "ffmpeg", "4K clip"],
+    "Paste a YouTube link, pick the exact seconds, and download just that clip in up to 4K — free, no account, no cookies required, no watermark. fclip streams only the byte-ranges it needs and falls back to its relay network when YouTube walls the server.",
+  keywords: [
+    "fclip",
+    "video clipper",
+    "YouTube cutter",
+    "trim video online",
+    "yt-dlp",
+    "ffmpeg",
+    "4K clip",
+    "youtube clipper no cookies",
+    "youtube trimmer",
+  ],
   icons: {
     icon: "/fclip.svg",
   },
   openGraph: {
-    title: "fclip — Free Online Video Clipper",
-    description: "Cut YouTube clips online and download up to 4K, without downloading the whole video.",
+    title: "fclip — Cut YouTube Clips Online, No Cookies Needed",
+    description:
+      "Cut YouTube clips online and download up to 4K, without downloading the whole video — and without logging in.",
     siteName: "fclip",
     type: "website",
   },
