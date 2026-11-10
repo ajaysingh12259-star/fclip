@@ -1094,7 +1094,7 @@ export default function Home() {
                   <ol className="space-y-1.5 text-xs leading-relaxed text-muted-foreground">
                     <li><strong className="text-foreground">1 · Direct</strong> — yt-dlp with BotGuard PO tokens, no cookies.</li>
                     <li><strong className="text-foreground">2 · Storm</strong> — parallel player-identity bursts until one gets through.</li>
-                    <li><strong className="text-foreground">3 · Turbo relay</strong> — residential-egress extraction + byte proxy. Zero cookies, beats the bot wall.</li>
+                    <li><strong className="text-foreground">3 · Turbo relay + HD render</strong> — residential-egress extraction + premium render farm: 1080p60 with zero cookies, beats the bot wall.</li>
                     <li><strong className="text-foreground">4 · Community relays</strong> — public Piped/Invidious instances as backup.</li>
                     <li><strong className="text-foreground">Cookies</strong> — optional booster, never a requirement.</li>
                   </ol>

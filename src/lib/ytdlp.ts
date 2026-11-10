@@ -16,6 +16,7 @@ import {
   type RelayInfo,
   type CobaltMedia,
 } from "@/lib/instances";
+import { vlCreateClip } from "@/lib/videolimit";
 
 /* ------------------------------------------------------------------ */
 /* Paths                                                              */
@@ -729,7 +730,7 @@ function relayToVideoInfo(relay: RelayInfo, url: string): VideoInfo {
     qualities: qualitiesFinal,
     route: "relay",
     qualityHint: turbo
-      ? "Turbo route active: served through fclip's cookie-less relay backbone — no bot wall, no login. 360p is guaranteed; higher options are attempted through 4K-capable tunnel relays (measured live up to 2160p VP9). If every relay refuses, your clip still lands in 360p."
+      ? "Turbo HD active: the premium render farm now cuts your range in true 1080p60 (h264+aac) with zero cookies — measured live. 4K attempts ride 4K-capable tunnel relays (up to 2160p VP9); if every relay refuses, your clip still lands in 360p."
       : "Served through fclip's cookie-less relay network (public Piped/Invidious instances) — no YouTube cookies involved. Relay quality usually tops out around 360–720p; for full 4K add cookies in Settings.",
     webpageUrl: url,
   };
@@ -1129,12 +1130,17 @@ async function urlServesBytes(url: string): Promise<boolean> {
 /**
  * Cookie-less relay cut, ordered as a quality ladder:
  *  1. For ≤480p requests: the turbo fast path (ranged stream-cut, cheapest).
- *  2. For HD/4K requests: cobalt tunnels first — measured live, one host
- *     tunnels TRUE 4K (3840x2160 VP9) from datacenter IPs with zero cookies.
- *     Tunnels relay the full stream (no ranges), so the whole source is
- *     downloaded once and ffmpeg stream-copies the range locally.
- *  3. Turbo fast path as the HD fallback (360p floor — never dead).
- *  4. Instance-proxied googlevideo URLs (rare).
+ *  2. For HD requests: VideoLimit HD render — their backend relays to the
+ *     same premium clipscutter render farm as the turbo route but serves
+ *     TRUE 1080p60 h264+aac to anonymous callers (measured live, ffprobe
+ *     verified). Only the clip bytes cross the wire; the file is already
+ *     cut when it lands.
+ *  3. For 1440p/4K attempts: cobalt tunnels — one host tunnels TRUE 4K
+ *     (3840x2160 VP9) from datacenter IPs. Tunnels relay the full stream
+ *     (no ranges), so the whole source is downloaded once and ffmpeg
+ *     stream-copies the range locally.
+ *  4. Turbo fast path as the HD fallback (360p floor — never dead).
+ *  5. Instance-proxied googlevideo URLs (rare).
  */
 async function relayCut(
   job: ClipJob,
@@ -1152,11 +1158,38 @@ async function relayCut(
     if (done) return;
   }
 
-  // 2. HD/4K: tunnel relays (full download → local range cut).
-  const videoLen = cachedRelayDuration(extractVideoId(params.url) ?? "");
-  // Tunneling means downloading the whole video once — only sane up to ~45 min.
+  // 2. HD: VideoLimit render relay (server-side cut, 1080p60 ceiling, free tier).
+  const videoId = extractVideoId(params.url);
+  const videoLen = cachedRelayDuration(videoId ?? "");
+  const clipLen = params.end - params.start;
+  if (wantHd && videoId && clipLen <= 10 * 60) {
+    try {
+      job.status = "running";
+      job.stage = "Relay: rendering HD clip (1080p60)";
+      job.progress = 55;
+      job.log.push("[fclip] HD render relay — sending the range to the premium render farm…");
+      const clip = await vlCreateClip(videoId, params.start, params.end);
+      job.log.push(`[fclip] render farm returned ${clip.quality} ${clip.format} — downloading the finished clip…`);
+      job.stage = "Relay: downloading rendered HD clip";
+      job.progress = 75;
+      const ok = await downloadTunnelFile(job, clip.url, out);
+      if (ok) {
+        job.stage = "Finalizing";
+        job.progress = 100;
+        return;
+      }
+      job.log.push("[fclip] rendered clip download failed — falling back to tunnel relays…");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      job.log.push(`[fclip] HD render relay unavailable (${msg}) — trying tunnel relays…`);
+    }
+  }
+
+  // 3. 1440p/4K attempts: tunnel relays (full download → local range cut).
   const cobaltAllowed = videoLen === null || videoLen <= 45 * 60;
-  if (cobaltAllowed && isYouTubeUrl(params.url)) {
+  const isYt = isYouTubeUrl(params.url);
+  // Tunneling means downloading the whole video once — only sane up to ~45 min.
+  if (cobaltAllowed && isYt) {
     const tunnels = await fetchCobaltTunnels(params.url, params.maxHeight).catch(() => [] as CobaltMedia[]);
     for (const cobalt of tunnels) {
       const full = path.join(dir, `source-${cobalt.host}.mp4`);
