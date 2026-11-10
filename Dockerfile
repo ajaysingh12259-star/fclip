@@ -33,7 +33,9 @@ COPY --from=build /app/.next/static ./.next/static
 COPY --from=build /app/public ./public
 
 RUN mkdir -p /app/.data/clips
-VOLUME ["/app/.data"]
+# NOTE: no docker VOLUME directive — Railway rejects it; Railway Volumes
+# (mount path /app/.data) provide persistence on Railway, docker-compose.yml
+# still declares its own named volume for local/VPS runs.
 
 EXPOSE 3000
 CMD ["node", "server.js"]
