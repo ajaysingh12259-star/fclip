@@ -1,0 +1,949 @@
+     1→     1→"use client";
+     2→     2→
+     3→     3→import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+     4→     4→import { Button } from "@/components/ui/button";
+     5→     5→import { Input } from "@/components/ui/input";
+     6→     6→import { Badge } from "@/components/ui/badge";
+     7→     7→import { Card, CardContent } from "@/components/ui/card";
+     8→     8→import { Progress } from "@/components/ui/progress";
+     9→     9→import { Skeleton } from "@/components/ui/skeleton";
+    10→    10→import { Switch } from "@/components/ui/switch";
+    11→    11→import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+    12→    12→import {
+    13→    13→  Select,
+    14→    14→  SelectContent,
+    15→    15→  SelectItem,
+    16→    16→  SelectTrigger,
+    17→    17→  SelectValue,
+    18→    18→} from "@/components/ui/select";
+    19→    19→import {
+    20→    20→  Accordion,
+    21→    21→  AccordionContent,
+    22→    22→  AccordionItem,
+    23→    23→  AccordionTrigger,
+    24→    24→} from "@/components/ui/accordion";
+    25→    25→import { useToast } from "@/hooks/use-toast";
+    26→    26→import { Timeline } from "@/components/fclip/timeline";
+    27→    27→import { YtPlayer, type YtPlayerHandle } from "@/components/fclip/yt-player";
+    28→    28→import { CookiesDialog } from "@/components/fclip/cookies-dialog";
+    29→    29→import {
+    30→    30→  Scissors,
+    31→    31→  Link2,
+    32→    32→  Download,
+    33→    33→  Loader2,
+    34→    34→  KeyRound,
+    35→    35→  Clapperboard,
+    36→    36→  Timer,
+    37→    37→  Eye,
+    38→    38→  CalendarDays,
+    39→    39→  UserRound,
+    40→    40→  FlaskConical,
+    41→    41→  TriangleAlert,
+    42→    42→  XCircle,
+    43→    43→  CheckCircle2,
+    44→    44→  Trash2,
+    45→    45→  SlidersHorizontal,
+    46→    46→  ShieldCheck,
+    47→    47→  Globe,
+    48→    48→} from "lucide-react";
+    49→    49→
+    50→    50→/* ------------------------------------------------------------------ */
+    51→    51→/* Types                                                              */
+    52→    52→/* ------------------------------------------------------------------ */
+    53→    53→
+    54→    54→interface VideoInfo {
+    55→    55→  id: string | null;
+    56→    56→  title: string;
+    57→    57→  channel: string | null;
+    58→    58→  duration: number;
+    59→    59→  thumbnail: string | null;
+    60→    60→  viewCount: number | null;
+    61→    61→  uploadDate: string | null;
+    62→    62→  isLive: boolean;
+    63→    63→  chapters: { start: number; end: number; title: string }[] | null;
+    64→    64→  qualities: { height: number; tbr: number | null; ext: string }[];
+    65→    65→  webpageUrl: string;
+    66→    66→}
+    67→    67→
+    68→    68→interface JobView {
+    69→    69→  id: string;
+    70→    70→  url: string;
+    71→    71→  start: number;
+    72→    72→  end: number;
+    73→    73→  maxHeight: number | null;
+    74→    74→  precise: boolean;
+    75→    75→  title: string;
+    76→    76→  status: "queued" | "running" | "done" | "error" | "canceled";
+    77→    77→  stage: string;
+    78→    78→  progress: number;
+    79→    79→  logTail: string[];
+    80→    80→  filename: string | null;
+    81→    81→  filesize: number | null;
+    82→    82→  clipDuration: number | null;
+    83→    83→  error: string | null;
+    84→    84→  createdAt: number;
+    85→    85→}
+    86→    86→
+    87→    87→interface InfoError {
+    88→    88→  code: string;
+    89→    89→  message: string;
+    90→    90→}
+    91→    91→
+    92→    92→/* ------------------------------------------------------------------ */
+    93→    93→/* Helpers                                                            */
+    94→    94→/* ------------------------------------------------------------------ */
+    95→    95→
+    96→    96→const YT_ID_RE = /(?:youtube\.com\/(?:watch\?(?:[^#]*&)?v=|shorts\/|embed\/|live\/)|youtu\.be\/)([\w-]{11})/;
+    97→    97→
+    98→    98→function parseVideoId(url: string): string | null {
+    99→    99→  const m = url.match(YT_ID_RE);
+   100→   100→  return m ? m[1] : null;
+   101→   101→}
+   102→   102→
+   103→   103→function extractT(url: string): number | null {
+   104→   104→  const m = url.match(/[?&](?:t|start)=([\dhms.]+)/);
+   105→   105→  if (!m) return null;
+   106→   106→  const raw = m[1];
+   107→   107→  if (/^\d+(\.\d+)?$/.test(raw)) return parseFloat(raw);
+   108→   108→  const h = raw.match(/(\d+(?:\.\d+)?)h/);
+   109→   109→  const min = raw.match(/(\d+(?:\.\d+)?)m/);
+   110→   110→  const s = raw.match(/(\d+(?:\.\d+)?)s/);
+   111→   111→  const v = (h ? parseFloat(h[1]) * 3600 : 0) + (min ? parseFloat(min[1]) * 60 : 0) + (s ? parseFloat(s[1]) : 0);
+   112→   112→  return v > 0 ? v : null;
+   113→   113→}
+   114→   114→
+   115→   115→function parseTimeInput(text: string): number | null {
+   116→   116→  const t = text.trim();
+   117→   117→  if (!t) return null;
+   118→   118→  if (/^\d+(\.\d+)?$/.test(t)) return parseFloat(t);
+   119→   119→  const parts = t.split(":").map((p) => parseFloat(p));
+   120→   120→  if (parts.some((p) => isNaN(p) || p < 0)) return null;
+   121→   121→  let sec = 0;
+   122→   122→  for (const p of parts) sec = sec * 60 + p;
+   123→   123→  return sec;
+   124→   124→}
+   125→   125→
+   126→   126→function fmtClock(t: number): string {
+   127→   127→  const s = Math.floor(t % 60);
+   128→   128→  const m = Math.floor((t / 60) % 60);
+   129→   129→  const h = Math.floor(t / 3600);
+   130→   130→  const mm = h > 0 ? String(m).padStart(2, "0") : String(m);
+   131→   131→  return (h > 0 ? `${h}:` : "") + `${mm}:${String(s).padStart(2, "0")}`;
+   132→   132→}
+   133→   133→
+   134→   134→function fmtBytes(b: number | null): string {
+   135→   135→  if (!b || b <= 0) return "—";
+   136→   136→  if (b < 1024 * 1024) return `${Math.round(b / 1024)} KB`;
+   137→   137→  if (b < 1024 * 1024 * 1024) return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+   138→   138→  return `${(b / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+   139→   139→}
+   140→   140→
+   141→   141→const BITRATE_TABLE: Record<number, number> = { 2160: 22, 1440: 11, 1080: 6, 720: 3, 480: 1.5 };
+   142→   142→
+   143→   143→function estimateSizeMB(
+   144→   144→  start: number,
+   145→   145→  end: number,
+   146→   146→  quality: string,
+   147→   147→  qualities: { height: number; tbr: number | null }[]
+   148→   148→): number {
+   149→   149→  const dur = Math.max(0, end - start);
+   150→   150→  let mbps = 8;
+   151→   151→  if (quality === "best") {
+   152→   152→    const top = qualities[0];
+   153→   153→    if (top) mbps = top.tbr ? top.tbr / 1000 : BITRATE_TABLE[top.height] ?? 8;
+   154→   154→  } else {
+   155→   155→    const h = Number(quality);
+   156→   156→    const q = qualities.find((x) => x.height === h);
+   157→   157→    mbps = q ? (q.tbr ? q.tbr / 1000 : BITRATE_TABLE[h] ?? 5) : BITRATE_TABLE[h] ?? 5;
+   158→   158→  }
+   159→   159→  return Math.max(1, Math.round((dur * mbps) / 8));
+   160→   160→}
+   161→   161→
+   162→   162→async function jsonFetch<T>(url: string, init?: RequestInit): Promise<{ ok: boolean; data: T }> {
+   163→   163→  const res = await fetch(url, init);
+   164→   164→  const data = (await res.json()) as T;
+   165→   165→  return { ok: res.ok, data };
+   166→   166→}
+   167→   167→
+   168→   168→/* ------------------------------------------------------------------ */
+   169→   169→/* Page                                                               */
+   170→   170→/* ------------------------------------------------------------------ */
+   171→   171→
+   172→   172→export default function Home() {
+   173→   173→  const { toast } = useToast();
+   174→   174→
+   175→   175→  const [url, setUrl] = useState("");
+   176→   176→  const [info, setInfo] = useState<VideoInfo | null>(null);
+   177→   177→  const [infoLoading, setInfoLoading] = useState(false);
+   178→   178→  const [infoError, setInfoError] = useState<InfoError | null>(null);
+   179→   179→  const [thumbError, setThumbError] = useState(false);
+   180→   180→
+   181→   181→  const [start, setStart] = useState(0);
+   182→   182→  const [end, setEnd] = useState(10);
+   183→   183→  const [startText, setStartText] = useState("0:00");
+   184→   184→  const [endText, setEndText] = useState("0:10");
+   185→   185→
+   186→   186→  const [quality, setQuality] = useState("best");
+   187→   187→  const [precise, setPrecise] = useState(false);
+   188→   188→
+   189→   189→  const [job, setJob] = useState<JobView | null>(null);
+   190→   190→  const [recent, setRecent] = useState<JobView[]>([]);
+   191→   191→  const [startingClip, setStartingClip] = useState(false);
+   192→   192→
+   193→   193→  const [cookiesOpen, setCookiesOpen] = useState(false);
+   194→   194→  const [cookiesPresent, setCookiesPresent] = useState(false);
+   195→   195→
+   196→   196→  const playerRef = useRef<YtPlayerHandle>(null);
+   197→   197→
+   198→   198→  const ytId = useMemo(() => info?.id ?? parseVideoId(url), [info, url]);
+   199→   199→  const busyJob = job && (job.status === "running" || job.status === "queued");
+   200→   200→
+   201→   201→  /* ---------------- data loading ---------------- */
+   202→   202→
+   203→   203→  const refreshRecent = useCallback(async () => {
+   204→   204→    const { ok, data } = await jsonFetch<{ jobs: JobView[] }>("/api/clip");
+   205→   205→    if (ok) setRecent(data.jobs);
+   206→   206→  }, []);
+   207→   207→
+   208→   208→  useEffect(() => {
+   209→   209→    void refreshRecent();
+   210→   210→    void jsonFetch<{ present: boolean }>("/api/cookies").then(({ ok, data }) => {
+   211→   211→      if (ok) setCookiesPresent(data.present);
+   212→   212→    });
+   213→   213→  }, [refreshRecent]);
+   214→   214→
+   215→   215→  const fetchInfoFor = useCallback(
+   216→   216→    async (target: string) => {
+   217→   217→      setInfoLoading(true);
+   218→   218→      setInfoError(null);
+   219→   219→      setInfo(null);
+   220→   220→      setJob(null);
+   221→   221→      try {
+   222→   222→        const { ok, data } = await jsonFetch<{ info?: VideoInfo; error?: InfoError }>("/api/info", {
+   223→   223→          method: "POST",
+   224→   224→          headers: { "Content-Type": "application/json" },
+   225→   225→          body: JSON.stringify({ url: target }),
+   226→   226→        });
+   227→   227→        if (!ok || !data.info) {
+   228→   228→          setInfoError(data.error ?? { code: "unknown", message: "Could not fetch video info." });
+   229→   229→          return;
+   230→   230→        }
+   231→   231→        const v = data.info;
+   232→   232→        setInfo(v);
+   233→   233→        setThumbError(false);
+   234→   234→        const t = extractT(target);
+   235→   235→        const s = t !== null ? Math.min(t, Math.max(0, v.duration - 1)) : 0;
+   236→   236→        const e = Math.min(s + 30, v.duration || s + 30);
+   237→   237→        setStart(Math.round(s * 10) / 10);
+   238→   238→        setEnd(Math.round(Math.max(s + 1, e) * 10) / 10);
+   239→   239→        setQuality("best");
+   240→   240→      } catch {
+   241→   241→        setInfoError({ code: "network", message: "Could not reach the fclip server." });
+   242→   242→      } finally {
+   243→   243→        setInfoLoading(false);
+   244→   244→      }
+   245→   245→    },
+   246→   246→    []
+   247→   247→  );
+   248→   248→
+   249→   249→  const submitUrl = () => {
+   250→   250→    const u = url.trim();
+   251→   251→    if (!u) {
+   252→   252→      toast({ title: "Paste a video link first", variant: "destructive" });
+   253→   253→      return;
+   254→   254→    }
+   255→   255→    if (!/^https?:\/\//i.test(u)) {
+   256→   256→      toast({
+   257→   257→        title: "That does not look like a URL",
+   258→   258→        description: "It should start with http:// or https://",
+   259→   259→        variant: "destructive",
+   260→   260→      });
+   261→   261→      return;
+   262→   262→    }
+   263→   263→    void fetchInfoFor(u);
+   264→   264→  };
+   265→   265→
+   266→   266→  const loadDemo = async () => {
+   267→   267→    setInfoLoading(true);
+   268→   268→    try {
+   269→   269→      const { ok, data } = await jsonFetch<{ url?: string; error?: string }>("/api/demo", { method: "POST" });
+   270→   270→      if (ok && data.url) {
+   271→   271→        setUrl(data.url);
+   272→   272→        await fetchInfoFor(data.url);
+   273→   273→        toast({ title: "Demo video loaded", description: "A local test clip you can cut & download right away." });
+   274→   274→      } else {
+   275→   275→        toast({ title: "Demo failed", description: data.error ?? "Unknown error", variant: "destructive" });
+   276→   276→      }
+   277→   277→    } finally {
+   278→   278→      setInfoLoading(false);
+   279→   279→    }
+   280→   280→  };
+   281→   281→
+   282→   282→  /* ---------------- time sync ---------------- */
+   283→   283→
+   284→   284→  const applyRange = useCallback((s: number, e: number) => {
+   285→   285→    setStart(s);
+   286→   286→    setEnd(e);
+   287→   287→    setStartText(fmtClock(s));
+   288→   288→    setEndText(fmtClock(e));
+   289→   289→  }, []);
+   290→   290→
+   291→   291→  useEffect(() => {
+   292→   292→    setStartText(fmtClock(start));
+   293→   293→    setEndText(fmtClock(end));
+   294→   294→  }, [start, end]);
+   295→   295→
+   296→   296→  const commitTime = (which: "start" | "end") => {
+   297→   297→    const parsed = parseTimeInput(which === "start" ? startText : endText);
+   298→   298→    if (parsed === null) {
+   299→   299→      toast({
+   300→   300→        title: "Could not read that time",
+   301→   301→        description: "Use formats like 90, 1:30 or 1:02:30",
+   302→   302→        variant: "destructive",
+   303→   303→      });
+   304→   304→      applyRange(start, end);
+   305→   305→      return;
+   306→   306→    }
+   307→   307→    const max = info?.duration ?? 36000;
+   308→   308→    if (which === "start") {
+   309→   309→      const s = Math.min(parsed, Math.max(0, end - 1), Math.max(0, max - 1));
+   310→   310→      applyRange(Math.round(s * 10) / 10, end);
+   311→   311→    } else {
+   312→   312→      const e = Math.max(parsed, start + 1, Math.min(max, start + 1));
+   313→   313→      applyRange(start, Math.round(Math.min(e, max) * 10) / 10);
+   314→   314→    }
+   315→   315→  };
+   316→   316→
+   317→   317→  const grabPlayerTime = (which: "start" | "end") => {
+   318→   318→    const t = playerRef.current?.getCurrentTime() ?? null;
+   319→   319→    if (t === null) {
+   320→   320→      toast({ title: "Player not ready yet", variant: "destructive" });
+   321→   321→      return;
+   322→   322→    }
+   323→   323→    if (which === "start") applyRange(Math.round(Math.min(t, end - 1) * 10) / 10, end);
+   324→   324→    else applyRange(start, Math.round(Math.max(t, start + 1) * 10) / 10);
+   325→   325→  };
+   326→   326→
+   327→   327→  /* ---------------- clip actions ---------------- */
+   328→   328→
+   329→   329→  const startClip = async () => {
+   330→   330→    if (!info) return;
+   331→   331→    if (end <= start) {
+   332→   332→      toast({ title: "End must be after start", variant: "destructive" });
+   333→   333→      return;
+   334→   334→    }
+   335→   335→    setStartingClip(true);
+   336→   336→    try {
+   337→   337→      const { ok, data } = await jsonFetch<{ job?: JobView; error?: string }>("/api/clip", {
+   338→   338→        method: "POST",
+   339→   339→        headers: { "Content-Type": "application/json" },
+   340→   340→        body: JSON.stringify({
+   341→   341→          url: info.webpageUrl,
+   342→   342→          start,
+   343→   343→          end,
+   344→   344→          maxHeight: quality === "best" ? null : Number(quality),
+   345→   345→          precise,
+   346→   346→          title: info.title,
+   347→   347→        }),
+   348→   348→      });
+   349→   349→      if (ok && data.job) {
+   350→   350→        setJob(data.job);
+   351→   351→        void refreshRecent();
+   352→   352→        toast({ title: "Cutting started", description: "Only the selected byte-ranges are being fetched." });
+   353→   353→      } else {
+   354→   354→        toast({ title: "Could not start the clip", description: data.error, variant: "destructive" });
+   355→   355→      }
+   356→   356→    } catch {
+   357→   357→      toast({ title: "Network error", variant: "destructive" });
+   358→   358→    } finally {
+   359→   359→      setStartingClip(false);
+   360→   360→    }
+   361→   361→  };
+   362→   362→
+   363→   363→  const removeJobById = async (id: string) => {
+   364→   364→    await fetch(`/api/clip?jobId=${id}`, { method: "DELETE" });
+   365→   365→    if (job?.id === id) setJob(null);
+   366→   366→    void refreshRecent();
+   367→   367→  };
+   368→   368→
+   369→   369→  const jobActive = job?.status === "running" || job?.status === "queued";
+   370→   370→
+   371→   371→  /* poll the active job */
+   372→   372→  useEffect(() => {
+   373→   373→    if (!job || !jobActive) return;
+   374→   374→    const id = job.id;
+   375→   375→    const iv = setInterval(async () => {
+   376→   376→      const { ok, data } = await jsonFetch<{ job: JobView }>(`/api/clip?jobId=${id}`);
+   377→   377→      if (ok) {
+   378→   378→        setJob(data.job);
+   379→   379→        if (data.job.status === "done") {
+   380→   380→          toast({ title: "Clip ready 🎬", description: "Your download is waiting below." });
+   381→   381→          void refreshRecent();
+   382→   382→        } else if (data.job.status === "error") {
+   383→   383→          void refreshRecent();
+   384→   384→        }
+   385→   385→      }
+   386→   386→    }, 1200);
+   387→   387→    return () => clearInterval(iv);
+   388→   388→  }, [job?.id, jobActive, job?.status, refreshRecent, toast]);
+   389→   389→
+   390→   390→  /* ---------------- derived UI data ---------------- */
+   391→   391→
+   392→   392→  const duration = info?.duration ?? 0;
+   393→   393→  const clipLen = Math.max(0, end - start);
+   394→   394→  const estMB = info ? estimateSizeMB(start, end, quality, info.qualities) : 0;
+   395→   395→  const topQualities = (info?.qualities ?? []).slice(0, 3);
+   396→   396→  const selectedHeight = quality === "best" ? null : Number(quality);
+   397→   397→  const isWebmPick = selectedHeight !== null && selectedHeight >= 1440;
+   398→   398→  const clipInvalid = end <= start;
+   399→   399→  const recentOthers = recent.filter((j) => j.id !== job?.id);
+   400→   400→
+   401→   401→  return (
+   402→   402→    <div className="flex min-h-screen flex-col bg-background text-foreground">
+   403→   403→      {/* ambient glow */}
+   404→   404→      <div aria-hidden className="pointer-events-none fixed inset-x-0 top-0 h-72 bg-gradient-to-b from-red-500/10 via-orange-500/5 to-transparent" />
+   405→   405→
+   406→   406→      {/* header */}
+   407→   407→      <header className="sticky top-0 z-40 border-b bg-background/80 backdrop-blur">
+   408→   408→        <div className="mx-auto flex h-14 w-full max-w-5xl items-center justify-between px-4">
+   409→   409→          <div className="flex items-center gap-2.5">
+   410→   410→            <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-red-500 to-orange-500 shadow-sm">
+   411→   411→              <Scissors className="h-4.5 w-4.5 text-white" aria-hidden />
+   412→   412→            </div>
+   413→   413→            <span className="text-lg font-bold tracking-tight">fclip</span>
+   414→   414→            <Badge variant="outline" className="text-[10px] uppercase tracking-wide text-muted-foreground">
+   415→   415→              free · no login
+   416→   416→            </Badge>
+   417→   417→          </div>
+   418→   418→          <Button
+   419→   419→            variant="ghost"
+   420→   420→            size="sm"
+   421→   421→            onClick={() => setCookiesOpen(true)}
+   422→   422→            aria-label="Cookie settings"
+   423→   423→            className="gap-2"
+   424→   424→          >
+   425→   425→            <KeyRound className="h-4 w-4" aria-hidden />
+   426→   426→            <span className="hidden sm:inline">Cookies {cookiesPresent ? "· saved ✓" : ""}</span>
+   427→   427→          </Button>
+   428→   428→        </div>
+   429→   429→      </header>
+   430→   430→
+   431→   431→      {/* main */}
+   432→   432→      <main className="relative mx-auto w-full max-w-5xl flex-1 px-4 pb-16 pt-10">
+   433→   433→        {/* hero */}
+   434→   434→        <section className="mb-8 text-center">
+   435→   435→          <h1 className="text-balance text-3xl font-extrabold tracking-tight sm:text-4xl">
+   436→   436→            Cut YouTube clips online — <span className="bg-gradient-to-r from-red-500 to-orange-500 bg-clip-text text-transparent">free & in up to 4K</span>
+   437→   437→          </h1>
+   438→   438→          <p className="mx-auto mt-3 max-w-2xl text-pretty text-sm leading-relaxed text-muted-foreground sm:text-base">
+   439→   439→            Paste a link, pick the exact seconds, download just that part. fclip fetches
+   440→   440→            <strong className="text-foreground"> only the byte-ranges it needs</strong> — a 30-second cut from a
+   441→   441→            4 GB 4K video transfers a fraction of the file. No account, no watermark.
+   442→   442→          </p>
+   443→   443→        </section>
+   444→   444→
+   445→   445→        {/* URL bar */}
+   446→   446→        <section aria-label="Video URL" className="mb-6">
+   447→   447→          <Card className="border-border/60 shadow-sm">
+   448→   448→            <CardContent className="p-4 sm:p-5">
+   449→   449→              <div className="flex flex-col gap-3 sm:flex-row">
+   450→   450→                <div className="relative flex-1">
+   451→   451→                  <Link2 className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden />
+   452→   452→                  <Input
+   453→   453→                    value={url}
+   454→   454→                    onChange={(e) => setUrl(e.target.value)}
+   455→   455→                    onKeyDown={(e) => e.key === "Enter" && !infoLoading && submitUrl()}
+   456→   456→                    placeholder="https://www.youtube.com/watch?v=…"
+   457→   457→                    className="h-11 pl-9 text-sm sm:text-base"
+   458→   458→                    aria-label="Video URL"
+   459→   459→                    inputMode="url"
+   460→   460→                    autoComplete="off"
+   461→   461→                    spellCheck={false}
+   462→   462→                  />
+   463→   463→                </div>
+   464→   464→                <div className="flex gap-2">
+   465→   465→                  <Button
+   466→   466→                    onClick={submitUrl}
+   467→   467→                    disabled={infoLoading}
+   468→   468→                    className="h-11 flex-1 gap-2 bg-gradient-to-r from-red-500 to-orange-500 text-white hover:opacity-90 sm:flex-none sm:px-6"
+   469→   469→                  >
+   470→   470→                    {infoLoading ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Clapperboard className="h-4 w-4" aria-hidden />}
+   471→   471→                    Fetch video
+   472→   472→                  </Button>
+   473→   473→                  <Button onClick={loadDemo} disabled={infoLoading} variant="outline" className="h-11 gap-2">
+   474→   474→                    <FlaskConical className="h-4 w-4" aria-hidden />
+   475→   475→                    Demo
+   476→   476→                  </Button>
+   477→   477→                </div>
+   478→   478→              </div>
+   479→   479→              <p className="mt-2.5 text-xs text-muted-foreground">
+   480→   480→                Works with youtube.com, youtu.be, Shorts, and any direct video URL — timestamps in the link
+   481→   481→                (<code className="rounded bg-muted px-1">&amp;t=90</code>) pre-fill the clip start.
+   482→   482→              </p>
+   483→   483→            </CardContent>
+   484→   484→          </Card>
+   485→   485→        </section>
+   486→   486→
+   487→   487→        {/* info error */}
+   488→   488→        {infoError && (
+   489→   489→          <section className="mb-6" aria-live="polite">
+   490→   490→            <Alert className={infoError.code === "bot_check" ? "border-amber-500/50 bg-amber-500/10 text-amber-900 dark:text-amber-200" : "border-red-500/50 bg-red-500/10"}>
+   491→   491→              <TriangleAlert className="h-4 w-4" aria-hidden />
+   492→   492→              <AlertTitle>{infoError.code === "bot_check" ? "YouTube wants to verify this server" : "Could not fetch this video"}</AlertTitle>
+   493→   493→              <AlertDescription className="mt-1.5 space-y-3 text-sm">
+   494→   494→                <p>{infoError.message}</p>
+   495→   495→                {infoError.code === "bot_check" && (
+   496→   496→                  <div className="flex flex-wrap gap-2">
+   497→   497→                    <Button size="sm" onClick={() => setCookiesOpen(true)} className="gap-2 bg-gradient-to-r from-red-500 to-orange-500 text-white hover:opacity-90">
+   498→   498→                      <KeyRound className="h-4 w-4" aria-hidden /> Add browser cookies
+   499→   499→                    </Button>
+   500→   500→                    <span className="py-1.5 text-xs text-muted-foreground">or try again — it can be a transient rate-limit.</span>
+   501→   501→                  </div>
+   502→   502→                )}
+   503→   503→              </AlertDescription>
+   504→   504→            </Alert>
+   505→   505→          </section>
+   506→   506→        )}
+   507→   507→
+   508→   508→        {/* loading skeleton */}
+   509→   509→        {infoLoading && (
+   510→   510→          <section className="mb-6">
+   511→   511→            <Card><CardContent className="flex flex-col gap-4 p-4 sm:flex-row sm:p-6">
+   512→   512→              <Skeleton className="aspect-video w-full rounded-lg sm:w-80" />
+   513→   513→              <div className="flex-1 space-y-3">
+   514→   514→                <Skeleton className="h-6 w-3/4" />
+   515→   515→                <Skeleton className="h-4 w-1/2" />
+   516→   516→                <Skeleton className="h-4 w-1/3" />
+   517→   517→                <Skeleton className="h-9 w-full" />
+   518→   518→              </div>
+   519→   519→            </CardContent></Card>
+   520→   520→          </section>
+   521→   521→        )}
+   522→   522→
+   523→   523→        {/* video info + editor */}
+   524→   524→        {info && !infoLoading && (
+   525→   525→          <section className="mb-6 space-y-4">
+   526→   526→            <Card className="border-border/60 shadow-sm">
+   527→   527→              <CardContent className="p-4 sm:p-6">
+   528→   528→                <div className="grid gap-4 sm:grid-cols-[minmax(0,22rem)_1fr] sm:gap-6">
+   529→   529→                  {/* thumbnail */}
+   530→   530→                  <div className="relative aspect-video w-full overflow-hidden rounded-lg border bg-gradient-to-br from-red-500/15 to-orange-500/15">
+   531→   531→                    {info.thumbnail && !thumbError ? (
+   532→   532→                      <img
+   533→   533→                        src={info.thumbnail}
+   534→   534→                        alt={`Thumbnail of ${info.title}`}
+   535→   535→                        className="h-full w-full object-cover"
+   536→   536→                        onError={() => setThumbError(true)}
+   537→   537→                      />
+   538→   538→                    ) : (
+   539→   539→                      <div className="flex h-full w-full items-center justify-center">
+   540→   540→                        <Clapperboard className="h-10 w-10 text-muted-foreground" aria-hidden />
+   541→   541→                      </div>
+   542→   542→                    )}
+   543→   543→                    <Badge className="absolute bottom-2 right-2 bg-black/80 text-white tabular-nums">
+   544→   544→                      {fmtClock(info.duration)}
+   545→   545→                    </Badge>
+   546→   546→                  </div>
+   547→   547→                  {/* meta */}
+   548→   548→                  <div className="min-w-0">
+   549→   549→                    <h2 className="line-clamp-2 text-base font-semibold leading-snug sm:text-lg">{info.title}</h2>
+   550→   550→                    <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground sm:text-sm">
+   551→   551→                      {info.channel && (
+   552→   552→                        <span className="inline-flex items-center gap-1.5">
+   553→   553→                          <UserRound className="h-3.5 w-3.5" aria-hidden /> {info.channel}
+   554→   554→                        </span>
+   555→   555→                      )}
+   556→   556→                      {info.viewCount != null && (
+   557→   557→                        <span className="inline-flex items-center gap-1.5">
+   558→   558→                          <Eye className="h-3.5 w-3.5" aria-hidden /> {info.viewCount.toLocaleString()} views
+   559→   559→                        </span>
+   560→   560→                      )}
+   561→   561→                      {info.uploadDate && (
+   562→   562→                        <span className="inline-flex items-center gap-1.5">
+   563→   563→                          <CalendarDays className="h-3.5 w-3.5" aria-hidden /> {info.uploadDate.slice(0, 4)}-{info.uploadDate.slice(4, 6)}-{info.uploadDate.slice(6, 8)}
+   564→   564→                        </span>
+   565→   565→                      )}
+   566→   566→                    </div>
+   567→   567→                    {topQualities.length > 0 && (
+   568→   568→                      <div className="mt-3 flex flex-wrap items-center gap-1.5">
+   569→   569→                        <span className="text-xs text-muted-foreground">Available:</span>
+   570→   570→                        {topQualities.map((q) => (
+   571→   571→                          <Badge key={q.height} variant="outline" className="tabular-nums">
+   572→   572→                            {q.height}p{q.height >= 2160 ? " · 4K" : q.height >= 1440 ? " · 2K" : ""}
+   573→   573→                          </Badge>
+   574→   574→                        ))}
+   575→   575→                      </div>
+   576→   576→                    )}
+   577→   577→                    {info.chapters && info.chapters.length > 0 && (
+   578→   578→                      <div className="mt-3">
+   579→   579→                        <p className="mb-1.5 text-xs text-muted-foreground">Chapters — tap to load one into the cutter:</p>
+   580→   580→                        <div className="flex max-h-24 flex-wrap gap-1.5 overflow-y-auto pr-1">
+   581→   581→                          {info.chapters.slice(0, 14).map((c, i) => (
+   582→   582→                            <button
+   583→   583→                              key={i}
+   584→   584→                              type="button"
+   585→   585→                              onClick={() => applyRange(c.start, Math.min(c.end, duration))}
+   586→   586→                              className="rounded-full border px-2.5 py-1 text-xs transition-colors hover:border-red-400 hover:bg-red-500/10"
+   587→   587→                              title={`${fmtClock(c.start)} → ${fmtClock(c.end)}`}
+   588→   588→                            >
+   589→   589→                              {c.title} <span className="tabular-nums text-muted-foreground">{fmtClock(c.start)}</span>
+   590→   590→                            </button>
+   591→   591→                          ))}
+   592→   592→                        </div>
+   593→   593→                      </div>
+   594→   594→                    )}
+   595→   595→                    {info.isLive && (
+   596→   596→                      <Alert className="mt-3 border-amber-500/50 bg-amber-500/10">
+   597→   597→                        <TriangleAlert className="h-4 w-4" aria-hidden />
+   598→   598→                        <AlertDescription className="text-xs">
+   599→   599→                          This is a live stream — fclip can only cut finished videos.
+   600→   600→                        </AlertDescription>
+   601→   601→                      </Alert>
+   602→   602→                    )}
+   603→   603→                  </div>
+   604→   604→                </div>
+   605→   605→              </CardContent>
+   606→   606→            </Card>
+   607→   607→
+   608→   608→            {/* clip editor */}
+   609→   609→            <Card className="border-border/60 shadow-sm">
+   610→   610→              <CardContent className="space-y-5 p-4 sm:p-6">
+   611→   611→                {ytId && (
+   612→   612→                  <div className="space-y-2">
+   613→   613→                    <YtPlayer ref={playerRef} videoId={ytId} />
+   614→   614→                    <div className="flex flex-wrap gap-2">
+   615→   615→                      <Button type="button" variant="outline" size="sm" onClick={() => grabPlayerTime("start")} className="gap-1.5">
+   616→   616→                        <Timer className="h-3.5 w-3.5 text-red-500" aria-hidden /> Set start to player time
+   617→   617→                      </Button>
+   618→   618→                      <Button type="button" variant="outline" size="sm" onClick={() => grabPlayerTime("end")} className="gap-1.5">
+   619→   619→                        <Timer className="h-3.5 w-3.5 text-orange-500" aria-hidden /> Set end to player time
+   620→   620→                      </Button>
+   621→   621→                      <span className="py-1 text-xs text-muted-foreground">Scrub the video above, then grab the exact second here.</span>
+   622→   622→                    </div>
+   623→   623→                  </div>
+   624→   624→                )}
+   625→   625→
+   626→   626→                <Timeline
+   627→   627→                  duration={duration || 60}
+   628→   628→                  start={start}
+   629→   629→                  end={end}
+   630→   630→                  chapters={info.chapters}
+   631→   631→                  onChange={applyRange}
+   632→   632→                />
+   633→   633→
+   634→   634→                {/* precise time inputs */}
+   635→   635→                <div className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end">
+   636→   636→                  <div>
+   637→   637→                    <label htmlFor="clip-start" className="mb-1.5 block text-xs font-medium text-muted-foreground">Start</label>
+   638→   638→                    <Input
+   639→   639→                      id="clip-start"
+   640→   640→                      value={startText}
+   641→   641→                      onChange={(e) => setStartText(e.target.value)}
+   642→   642→                      onBlur={() => commitTime("start")}
+   643→   643→                      onKeyDown={(e) => e.key === "Enter" && commitTime("start")}
+   644→   644→                      className="h-10 font-mono tabular-nums"
+   645→   645→                      inputMode="numeric"
+   646→   646→                      aria-describedby="clip-length-hint"
+   647→   647→                    />
+   648→   648→                  </div>
+   649→   649→                  <div>
+   650→   650→                    <label htmlFor="clip-end" className="mb-1.5 block text-xs font-medium text-muted-foreground">End</label>
+   651→   651→                    <Input
+   652→   652→                      id="clip-end"
+   653→   653→                      value={endText}
+   654→   654→                      onChange={(e) => setEndText(e.target.value)}
+   655→   655→                      onBlur={() => commitTime("end")}
+   656→   656→                      onKeyDown={(e) => e.key === "Enter" && commitTime("end")}
+   657→   657→                      className="h-10 font-mono tabular-nums"
+   658→   658→                      inputMode="numeric"
+   659→   659→                    />
+   660→   660→                  </div>
+   661→   661→                  <div id="clip-length-hint" className="flex items-center gap-2 rounded-lg border bg-muted/40 px-3 py-2 sm:mb-0">
+   662→   662→                    <div>
+   663→   663→                      <p className="text-xs text-muted-foreground">Selected</p>
+   664→   664→                      <p className="text-sm font-semibold tabular-nums">
+   665→   665→                        {fmtClock(clipLen)} <span className="font-normal text-muted-foreground">· ≈ {estMB} MB</span>
+   666→   666→                      </p>
+   667→   667→                    </div>
+   668→   668→                  </div>
+   669→   669→                </div>
+   670→   670→
+   671→   671→                {clipInvalid && (
+   672→   672→                  <p className="text-xs text-red-500">The end time must be after the start time.</p>
+   673→   673→                )}
+   674→   674→
+   675→   675→                {/* quality + precision */}
+   676→   676→                <div className="grid gap-4 sm:grid-cols-2">
+   677→   677→                  <div className="space-y-1.5">
+   678→   678→                    <label className="text-xs font-medium text-muted-foreground">Quality</label>
+   679→   679→                    <Select value={quality} onValueChange={setQuality}>
+   680→   680→                      <SelectTrigger className="h-10 w-full" aria-label="Clip quality">
+   681→   681→                        <SelectValue />
+   682→   682→                      </SelectTrigger>
+   683→   683→                      <SelectContent>
+   684→   684→                        <SelectItem value="best">Best available</SelectItem>
+   685→   685→                        {(info.qualities ?? []).map((q) => (
+   686→   686→                          <SelectItem key={q.height} value={String(q.height)}>
+   687→   687→                            {q.height}p{q.height >= 2160 ? " (4K)" : q.height >= 1440 ? " (2K)" : ""}
+   688→   688→                            {q.ext === "webm" ? " · VP9" : ""}
+   689→   689→                          </SelectItem>
+   690→   690→                        ))}
+   691→   691→                      </SelectContent>
+   692→   692→                    </Select>
+   693→   693→                    {info.qualities.length === 0 && (
+   694→   694→                      <p className="text-xs text-muted-foreground">Only &ldquo;best&rdquo; is offered for this source.</p>
+   695→   695→                    )}
+   696→   696→                    {isWebmPick && (
+   697→   697→                      <p className="text-xs text-amber-600 dark:text-amber-400">
+   698→   698→                        2K/4K on YouTube use VP9 (webm) — plays in browsers & VLC. Pick 1080p for classic MP4 (H.264).
+   699→   699→                      </p>
+   700→   700→                    )}
+   701→   701→                  </div>
+   702→   702→                  <div className="space-y-1.5">
+   703→   703→                    <label htmlFor="precise-switch" className="text-xs font-medium text-muted-foreground">Cut precision</label>
+   704→   704→                    <div className="flex h-10 items-center gap-3 rounded-lg border px-3">
+   705→   705→                      <Switch id="precise-switch" checked={precise} onCheckedChange={setPrecise} />
+   706→   706→                      <span className="text-sm">{precise ? "Frame-accurate" : "Fast (keyframe-aligned)"}</span>
+   707→   707→                    </div>
+   708→   708→                    <p className="text-xs text-muted-foreground">
+   709→   709→                      {precise
+   710→   710→                        ? "Re-encodes at the boundaries for exact timing — slower on high resolutions."
+   711→   711→                        : "Snaps to the nearest keyframe (±2 s) — instant, no re-encoding."}
+   712→   712→                    </p>
+   713→   713→                  </div>
+   714→   714→                </div>
+   715→   715→
+   716→   716→                {/* CTA */}
+   717→   717→                <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:items-center sm:justify-between">
+   718→   718→                  <p className="text-xs text-muted-foreground sm:max-w-sm">
+   719→   719→                    fclip streams only the fragments covering {fmtClock(start)} → {fmtClock(end)} — it never
+   720→   720→                    pulls the full {fmtClock(duration)} file.
+   721→   721→                  </p>
+   722→   722→                  <Button
+   723→   723→                    onClick={startClip}
+   724→   724→                    disabled={clipInvalid || info.isLive || !!busyJob || startingClip}
+   725→   725→                    className="h-11 gap-2 bg-gradient-to-r from-red-500 to-orange-500 text-white hover:opacity-90"
+   726→   726→                  >
+   727→   727→                    {busyJob || startingClip ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> : <Scissors className="h-4 w-4" aria-hidden />}
+   728→   728→                    {busyJob ? "Cutting…" : "Cut & download clip"}
+   729→   729→                  </Button>
+   730→   730→                </div>
+   731→   731→              </CardContent>
+   732→   732→            </Card>
+   733→   733→          </section>
+   734→   734→        )}
+   735→   735→
+   736→   736→        {/* active job */}
+   737→   737→        {job && (
+   738→   738→          <section className="mb-6" aria-live="polite">
+   739→   739→            <Card className={job.status === "error" ? "border-red-500/40" : job.status === "done" ? "border-emerald-500/40" : "border-border/60"}>
+   740→   740→              <CardContent className="space-y-3 p-4 sm:p-6">
+   741→   741→                <div className="flex items-start justify-between gap-3">
+   742→   742→                  <div className="min-w-0">
+   743→   743→                    <p className="flex items-center gap-2 text-sm font-semibold">
+   744→   744→                      {job.status === "done" && <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-500" aria-hidden />}
+   745→   745→                      {job.status === "error" && <XCircle className="h-4 w-4 shrink-0 text-red-500" aria-hidden />}
+   746→   746→                      {busyJob && <Loader2 className="h-4 w-4 shrink-0 animate-spin text-red-500" aria-hidden />}
+   747→   747→                      <span className="truncate">
+   748→   748→                        {job.status === "done" ? "Clip ready" : job.status === "error" ? "Clip failed" : job.stage}
+   749→   749→                      </span>
+   750→   750→                    </p>
+   751→   751→                    <p className="mt-0.5 truncate text-xs text-muted-foreground">
+   752→   752→                      {job.title} · {fmtClock(job.start)} → {fmtClock(job.end)}
+   753→   753→                      {job.maxHeight ? ` · ≤${job.maxHeight}p` : " · best"}
+   754→   754→                      {job.precise ? " · frame-accurate" : ""}
+   755→   755→                    </p>
+   756→   756→                  </div>
+   757→   757→                  <Button variant="ghost" size="icon" aria-label="Remove this job" onClick={() => removeJobById(job.id)}>
+   758→   758→                    <Trash2 className="h-4 w-4" aria-hidden />
+   759→   759→                  </Button>
+   760→   760→                </div>
+   761→   761→
+   762→   762→                {busyJob && (
+   763→   763→                  <div className="space-y-1">
+   764→   764→                    <Progress value={job.progress >= 0 ? job.progress : undefined} className="h-2.5" />
+   765→   765→                    <p className="text-xs tabular-nums text-muted-foreground">
+   766→   766→                      {job.progress >= 0 ? `${job.progress.toFixed(0)}%` : "working…"} — downloading only the needed ranges
+   767→   767→                    </p>
+   768→   768→                  </div>
+   769→   769→                )}
+   770→   770→
+   771→   771→                {job.status === "error" && job.error && (
+   772→   772→                  <p className="text-sm text-red-500">{job.error}</p>
+   773→   773→                )}
+   774→   774→
+   775→   775→                {job.status === "done" && (
+   776→   776→                  <div className="flex flex-col gap-3 rounded-lg border bg-muted/30 p-3 sm:flex-row sm:items-center sm:justify-between">
+   777→   777→                    <div className="min-w-0 text-sm">
+   778→   778→                      <p className="truncate font-medium">{job.filename}</p>
+   779→   779→                      <p className="text-xs tabular-nums text-muted-foreground">
+   780→   780→                        {fmtBytes(job.filesize)}
+   781→   781→                        {job.clipDuration ? ` · ${fmtClock(job.clipDuration)}` : ""} · saved for 2 hours
+   782→   782→                      </p>
+   783→   783→                    </div>
+   784→   784→                    <div className="flex shrink-0 gap-2">
+   785→   785→                      <a href={`/api/clip/file?jobId=${job.id}`} download>
+   786→   786→                        <Button className="gap-2 bg-gradient-to-r from-red-500 to-orange-500 text-white hover:opacity-90">
+   787→   787→                          <Download className="h-4 w-4" aria-hidden /> Download clip
+   788→   788→                        </Button>
+   789→   789→                      </a>
+   790→   790→                    </div>
+   791→   791→                  </div>
+   792→   792→                )}
+   793→   793→
+   794→   794→                {job.logTail.length > 0 && (
+   795→   795→                  <details className="group">
+   796→   796→                    <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
+   797→   797→                      Processing log ({job.logTail.length} lines)
+   798→   798→                    </summary>
+   799→   799→                    <pre className="mt-2 max-h-40 overflow-y-auto rounded-md border bg-muted/40 p-2.5 font-mono text-[11px] leading-relaxed text-muted-foreground">
+   800→   800→                      {job.logTail.join("\n")}
+   801→   801→                    </pre>
+   802→   802→                  </details>
+   803→   803→                )}
+   804→   804→              </CardContent>
+   805→   805→            </Card>
+   806→   806→          </section>
+   807→   807→        )}
+   808→   808→
+   809→   809→        {/* recent clips */}
+   810→   810→        {recentOthers.length > 0 && (
+   811→   811→          <section className="mb-6">
+   812→   812→            <h2 className="mb-2 text-sm font-semibold text-muted-foreground">Recent clips (this session)</h2>
+   813→   813→            <Card>
+   814→   814→              <CardContent className="max-h-72 space-y-2 overflow-y-auto p-3">
+   815→   815→                {recentOthers.map((j) => (
+   816→   816→                  <div key={j.id} className="flex items-center justify-between gap-3 rounded-lg border px-3 py-2">
+   817→   817→                    <div className="min-w-0">
+   818→   818→                      <p className="truncate text-sm font-medium">{j.title}</p>
+   819→   819→                      <p className="text-xs tabular-nums text-muted-foreground">
+   820→   820→                        {fmtClock(j.start)} → {fmtClock(j.end)} · {fmtBytes(j.filesize)} ·{" "}
+   821→   821→                        <span
+   822→   822→                          className={
+   823→   823→                            j.status === "done"
+   824→   824→                              ? "text-emerald-500"
+   825→   825→                              : j.status === "error"
+   826→   826→                              ? "text-red-500"
+   827→   827→                              : j.status === "canceled"
+   828→   828→                              ? "text-muted-foreground"
+   829→   829→                              : "text-amber-500"
+   830→   830→                          }
+   831→   831→                        >
+   832→   832→                          {j.status}
+   833→   833→                        </span>
+   834→   834→                      </p>
+   835→   835→                    </div>
+   836→   836→                    <div className="flex shrink-0 items-center gap-1">
+   837→   837→                      {j.status === "done" && (
+   838→   838→                        <a href={`/api/clip/file?jobId=${j.id}`} download aria-label={`Download ${j.title} clip`}>
+   839→   839→                          <Button variant="outline" size="icon" className="h-8 w-8">
+   840→   840→                            <Download className="h-4 w-4" aria-hidden />
+   841→   841→                          </Button>
+   842→   842→                        </a>
+   843→   843→                      )}
+   844→   844→                      <Button variant="ghost" size="icon" className="h-8 w-8" aria-label="Remove" onClick={() => removeJobById(j.id)}>
+   845→   845→                        <Trash2 className="h-4 w-4" aria-hidden />
+   846→   846→                      </Button>
+   847→   847→                    </div>
+   848→   848→                  </div>
+   849→   849→                ))}
+   850→   850→              </CardContent>
+   851→   851→            </Card>
+   852→   852→          </section>
+   853→   853→        )}
+   854→   854→
+   855→   855→        {/* how it works */}
+   856→   856→        <section className="mb-6">
+   857→   857→          <h2 className="mb-3 text-lg font-bold">How fclip works</h2>
+   858→   858→          <div className="grid gap-3 sm:grid-cols-3">
+   859→   859→            {[
+   860→   860→              { icon: Link2, title: "1 · Paste the link", text: "Any YouTube video, Shorts link, or direct video URL. Timestamped links pre-fill the start point." },
+   861→   861→              { icon: SlidersHorizontal, title: "2 · Pick seconds & quality", text: "Drag the timeline or use the built-in player to grab exact times — up to 2160p (4K) where available." },
+   862→   862→              { icon: Download, title: "3 · Download the clip", text: "yt-dlp fetches only the needed byte-ranges, ffmpeg trims & muxes, and your clip is ready — no watermark." },
+   863→   863→            ].map((s) => (
+   864→   864→              <Card key={s.title} className="border-border/60">
+   865→   865→                <CardContent className="p-4">
+   866→   866→                  <s.icon className="mb-2 h-5 w-5 text-red-500" aria-hidden />
+   867→   867→                  <h3 className="mb-1 text-sm font-semibold">{s.title}</h3>
+   868→   868→                  <p className="text-xs leading-relaxed text-muted-foreground">{s.text}</p>
+   869→   869→                </CardContent>
+   870→   870→              </Card>
+   871→   871→            ))}
+   872→   872→          </div>
+   873→   873→        </section>
+   874→   874→
+   875→   875→        {/* FAQ */}
+   876→   876→        <section>
+   877→   877→          <h2 className="mb-3 text-lg font-bold">FAQ</h2>
+   878→   878→          <Accordion type="single" collapsible className="rounded-lg border bg-card">
+   879→   879→            <AccordionItem value="q1" className="border-b px-4 last:border-b-0">
+   880→   880→              <AccordionTrigger className="text-sm">Is fclip really free?</AccordionTrigger>
+   881→   881→              <AccordionContent className="text-sm leading-relaxed text-muted-foreground">
+   882→   882→                Yes — no account, no watermark, no per-clip limits. fclip is a self-hostable web app built on
+   883→   883→                the open-source <strong className="text-foreground">yt-dlp</strong> and{" "}
+   884→   884→                <strong className="text-foreground">ffmpeg</strong> engines. Self-hosting it on your own
+   885→   885→                machine keeps everything free and private.
+   886→   886→              </AccordionContent>
+   887→   887→            </AccordionItem>
+   888→   888→            <AccordionItem value="q2" className="border-b px-4 last:border-b-0">
+   889→   889→              <AccordionTrigger className="text-sm">How can it cut 4K without downloading the whole 4 GB file?</AccordionTrigger>
+   890→   890→              <AccordionContent className="text-sm leading-relaxed text-muted-foreground">
+   891→   891→                Modern video streams are split into small segments that players request over HTTP. yt-dlp
+   892→   892→                seeks into the stream with byte-range requests and downloads only the fragments covering your
+   893→   893→                selected seconds (plus a little padding to the previous keyframe), then ffmpeg trims and
+   894→   894→                remuxes locally. A 30-second 4K cut typically transfers a few hundred megabytes instead of
+   895→   895→                gigabytes.
+   896→   896→              </AccordionContent>
+   897→   897→            </AccordionItem>
+   898→   898→            <AccordionItem value="q3" className="border-b px-4 last:border-b-0">
+   899→   899→              <AccordionTrigger className="text-sm">Why does YouTube sometimes ask for cookies?</AccordionTrigger>
+   900→   900→              <AccordionContent className="text-sm leading-relaxed text-muted-foreground">
+   901→   901→                YouTube aggressively rate-limits cloud and datacenter IPs with a &ldquo;confirm you&rsquo;re not a
+   902→   902→                bot&rdquo; wall. Adding your browser cookies (the official yt-dlp recommendation) or running
+   903→   903→                fclip on your own machine both fix it. The Cookies button in the header walks you through it.
+   904→   904→              </AccordionContent>
+   905→   905→            </AccordionItem>
+   906→   906→            <AccordionItem value="q4" className="px-4">
+   907→   907→              <AccordionTrigger className="text-sm">What may I download?</AccordionTrigger>
+   908→   908→              <AccordionContent className="text-sm leading-relaxed text-muted-foreground">
+   909→   909→                Use fclip for content you have the right to use — your own uploads, Creative-Commons or
+   910→   910→                public-domain material, or content whose license permits downloading. Respect creators and
+   911→   911→                the platform&rsquo;s terms of service.
+   912→   912→              </AccordionContent>
+   913→   913→            </AccordionItem>
+   914→   914→          </Accordion>
+   915→   915→        </section>
+   916→   916→      </main>
+   917→   917→
+   918→   918→      {/* footer */}
+   919→   919→      <footer className="mt-auto border-t bg-background">
+   920→   920→        <div className="mx-auto flex w-full max-w-5xl flex-col items-center justify-between gap-2 px-4 py-4 pb-[max(1rem,env(safe-area-inset-bottom))] text-center text-xs text-muted-foreground sm:flex-row sm:text-left">
+   921→   921→          <p className="flex items-center gap-1.5">
+   922→   922→            <ShieldCheck className="h-3.5 w-3.5 text-emerald-500" aria-hidden />
+   923→   923→            Use only with content you own or that is licensed for reuse — respect creators&rsquo; rights and
+   924→   924→            YouTube&rsquo;s Terms of Service.
+   925→   925→          </p>
+   926→   926→          <p className="flex items-center gap-1.5">
+   927→   927→            <Globe className="h-3.5 w-3.5" aria-hidden />
+   928→   928→            fclip · powered by yt-dlp + ffmpeg
+   929→   929→          </p>
+   930→   930→        </div>
+   931→   931→      </footer>
+   932→   932→
+   933→   933→      <CookiesDialog
+   934→   934→        open={cookiesOpen}
+   935→   935→        onOpenChange={setCookiesOpen}
+   936→   936→        cookiesPresent={cookiesPresent}
+   937→   937→        onSaved={() => {
+   938→   938→          setCookiesPresent(true);
+   939→   939→          toast({ title: "Cookies saved", description: "They will be used for all fetches from now on." });
+   940→   940→        }}
+   941→   941→        onCleared={() => {
+   942→   942→          setCookiesPresent(false);
+   943→   943→          toast({ title: "Cookies removed" });
+   944→   944→        }}
+   945→   945→      />
+   946→   946→    </div>
+   947→   947→  );
+   948→   948→}
+   949→   949→

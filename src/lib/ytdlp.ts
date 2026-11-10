@@ -10,7 +10,9 @@ import { randomUUID } from "crypto";
 /* Paths                                                              */
 /* ------------------------------------------------------------------ */
 
-export const DATA_DIR = path.join(process.cwd(), ".data");
+export const DATA_DIR = process.env.FCLIP_DATA_DIR
+  ? path.resolve(process.env.FCLIP_DATA_DIR)
+  : path.join(process.cwd(), ".data");
 export const CLIPS_DIR = path.join(DATA_DIR, "clips");
 export const COOKIES_PATH = path.join(DATA_DIR, "cookies.txt");
 export const DEMO_PATH = path.join(DATA_DIR, "demo.mp4");
@@ -108,6 +110,7 @@ export interface VideoInfo {
 const g = globalThis as unknown as {
   __fclipJobs: Map<string, ClipJob> | undefined;
   __fclipOptArgsOk: boolean | undefined;
+  __fclipTvClientOk: boolean | undefined;
 };
 
 const jobs: Map<string, ClipJob> = (g.__fclipJobs ??= new Map());
@@ -147,7 +150,36 @@ export function isLocalUrl(url: string): boolean {
   }
 }
 
+export function isYouTubeUrl(url: string): boolean {
+  return /(?:^|\.)(?:youtube\.com|youtu\.be|youtube-nocookie\.com)/i.test(
+    (() => {
+      try {
+        return new URL(url).hostname;
+      } catch {
+        return url;
+      }
+    })()
+  );
+}
+
+/**
+ * The YouTube `tv` / `android_vr` player clients frequently skip the
+ * "Sign in to confirm you're not a bot" wall that cloud IPs get — try them
+ * once before giving up so a fresh deployment can work with zero setup.
+ */
+const BOT_WALL_RE = /sign in to confirm|not a bot|bot check/i;
+
+function tvClientArgs(): string[] {
+  if (g.__fclipTvClientOk === false) return [];
+  return ["--extractor-args", "youtube:player_client=tv,android_vr"];
+}
+
 function cookieArgs(): string[] {
+  // Browser-cookie import is the quickest fix for the bot wall when fclip runs
+  // on a desktop machine, e.g. FCLIP_COOKIES_FROM_BROWSER=chrome (or firefox,
+  // edge, brave, vivaldi…). Both env spellings are accepted.
+  const browser = process.env.FCLIP_COOKIES_FROM_BROWSER || process.env.YTDLP_COOKIES_FROM_BROWSER;
+  if (browser) return ["--cookies-from-browser", browser];
   return existsSync(COOKIES_PATH) ? ["--cookies", COOKIES_PATH] : [];
 }
 
@@ -192,6 +224,24 @@ async function runYtDlp(args: string[], timeoutMs: number, url?: string): Promis
   ) {
     const r2 = await runOnce(getOptArgsOk(), true, args, timeoutMs);
     if (r2.code === 0) return r2;
+  }
+  // YouTube bot wall — retry once with the tv/android_vr player clients,
+  // which usually do not require sign-in from server IPs.
+  if (
+    r.code !== 0 &&
+    BOT_WALL_RE.test(r.stderr + r.stdout) &&
+    isYouTubeUrl(url ?? "") &&
+    g.__fclipTvClientOk !== false &&
+    tvClientArgs().length > 0
+  ) {
+    const r3 = await runOnce(getOptArgsOk(), false, [...args, ...tvClientArgs()], timeoutMs);
+    if (r3.code === 0) {
+      g.__fclipTvClientOk = true;
+      return r3;
+    }
+    if (/invalid choice|unrecognized|no such option/i.test(r3.stderr + r3.stdout)) {
+      g.__fclipTvClientOk = false; // yt-dlp too old for these clients — stop trying
+    }
   }
   return r;
 }
@@ -400,12 +450,26 @@ export function createClipJob(params: CreateJobParams): ClipJob {
     params.url,
   ];
 
-  const child = spawn(YT_DLP, [...coreArgs(), ...optionalArgs().flat(), ...(isLocalUrl(params.url) ? [] : impersonateArgs()), ...args], {
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  job.proc = child;
-  job.status = "running";
-  job.stage = "Resolving video streams";
+  const attempt = (extraArgs: string[], stageLabel: string) => {
+    const child = spawn(
+      YT_DLP,
+      [
+        ...coreArgs(),
+        ...optionalArgs().flat(),
+        ...(isLocalUrl(params.url) ? [] : impersonateArgs()),
+        ...extraArgs,
+        ...args,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+    job.proc = child;
+    job.status = "running";
+    job.stage = stageLabel;
+    return child;
+  };
+
+  let retriedTvClient = false;
+  let child = attempt([], "Resolving video streams");
 
   const pushLine = (line: string) => {
     const l = line.trim();
@@ -447,19 +511,44 @@ export function createClipJob(params: CreateJobParams): ClipJob {
     parts.forEach((p) => pushLine(p));
   });
 
-  child.on("close", (code) => {
+  const onClose = (code: number | null): void => {
     if (job.status === "canceled") return;
     job.proc = undefined;
     if (stderrBuf.trim()) pushLine(stderrBuf.trim());
     if (code === 0) {
       finalizeJob(job, dir);
-    } else {
-      job.status = "error";
-      const tail = job.log.slice(-4).join(" ");
-      job.error = classifyError(tail).message;
-      job.stage = "Failed";
+      return;
     }
-  });
+    const combined = job.log.join(" ") + stderrBuf;
+    // YouTube bot wall mid-download — one retry with tv/android_vr clients.
+    if (!retriedTvClient && BOT_WALL_RE.test(combined) && isYouTubeUrl(params.url) && tvClientArgs().length > 0) {
+      retriedTvClient = true;
+      job.log.push("[fclip] Bot wall hit — retrying with alternate YouTube clients…");
+      stdoutBuf = "";
+      stderrBuf = "";
+      child = attempt(tvClientArgs(), "Retrying with alternate YouTube clients");
+      child.stdout?.on("data", (d) => {
+        stdoutBuf += d.toString();
+        const parts = stdoutBuf.split("\n");
+        stdoutBuf = parts.pop() ?? "";
+        parts.forEach(pushLine);
+      });
+      child.stderr?.on("data", (d) => {
+        stderrBuf += d.toString();
+        const parts = stderrBuf.split("\n");
+        stderrBuf = parts.pop() ?? "";
+        parts.forEach((p) => pushLine(p));
+      });
+      child.on("close", onClose);
+      return;
+    }
+    job.status = "error";
+    const tail = job.log.slice(-4).join(" ");
+    job.error = classifyError(tail).message;
+    job.stage = "Failed";
+  };
+
+  child.on("close", onClose);
 
   return job;
 }
@@ -662,4 +751,10 @@ export async function ensureDemoVideo(): Promise<string> {
 
 export function getBinaryPaths() {
   return { ytDlp: YT_DLP, ffmpeg: FFMPEG, ffprobe: FFPROBE };
+}
+
+export function getCookiesMode(): "browser" | "file" | "none" {
+  const browser = process.env.FCLIP_COOKIES_FROM_BROWSER || process.env.YTDLP_COOKIES_FROM_BROWSER;
+  if (browser) return "browser";
+  return existsSync(COOKIES_PATH) ? "file" : "none";
 }

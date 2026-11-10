@@ -1,0 +1,15 @@
+node_modules
+.next
+.data
+db
+*.log
+.env
+.env.*
+tool-results
+download
+upload
+examples
+tests
+.git
+Dockerfile
+docker-compose.yml

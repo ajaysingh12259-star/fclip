@@ -1,0 +1,20 @@
+services:
+  fclip:
+    build: .
+    container_name: fclip
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    volumes:
+      - fclip-data:/app/.data
+    # Optional hardening / tweaks:
+    # environment:
+    #   - FCLIP_COOKIES_FROM_BROWSER=chrome   # desktop-only (no browser inside the container)
+    #   - YTDLP_PATH=/usr/local/bin/yt-dlp
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 2g
+
+volumes:
+  fclip-data:

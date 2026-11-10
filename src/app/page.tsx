@@ -45,6 +45,9 @@ import {
   SlidersHorizontal,
   ShieldCheck,
   Globe,
+  Play,
+  Square,
+  PencilLine,
 } from "lucide-react";
 
 /* ------------------------------------------------------------------ */
@@ -193,6 +196,13 @@ export default function Home() {
   const [cookiesOpen, setCookiesOpen] = useState(false);
   const [cookiesPresent, setCookiesPresent] = useState(false);
 
+  /** Server hit the YouTube bot wall — we keep going using the in-browser player. */
+  const [fallbackPending, setFallbackPending] = useState(false);
+  const [serverBlocked, setServerBlocked] = useState(false);
+  /** User chose to type times blind (no info, no player). */
+  const [manualMode, setManualMode] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
+
   const playerRef = useRef<YtPlayerHandle>(null);
 
   const ytId = useMemo(() => info?.id ?? parseVideoId(url), [info, url]);
@@ -218,6 +228,10 @@ export default function Home() {
       setInfoError(null);
       setInfo(null);
       setJob(null);
+      setFallbackPending(false);
+      setServerBlocked(false);
+      setManualMode(false);
+      setPreviewing(false);
       try {
         const { ok, data } = await jsonFetch<{ info?: VideoInfo; error?: InfoError }>("/api/info", {
           method: "POST",
@@ -226,6 +240,11 @@ export default function Home() {
         });
         if (!ok || !data.info) {
           setInfoError(data.error ?? { code: "unknown", message: "Could not fetch video info." });
+          // The bot wall only blocks the server — the YouTube player still works
+          // in the browser, so fall back to it for the preview + times.
+          if (data.error?.code === "bot_check" && parseVideoId(target)) {
+            setFallbackPending(true);
+          }
           return;
         }
         const v = data.info;
@@ -277,6 +296,107 @@ export default function Home() {
     } finally {
       setInfoLoading(false);
     }
+  };
+
+  /* ------- fallback: build info from the in-browser YouTube player ------- */
+
+  useEffect(() => {
+    if (!fallbackPending || !ytId) return;
+    const startedAt = Date.now();
+    const iv = setInterval(() => {
+      const player = playerRef.current;
+      const d = player?.getDuration() ?? 0;
+      if (d > 0) {
+        clearInterval(iv);
+        setFallbackPending(false);
+        setServerBlocked(true);
+        const vd = player?.getVideoData();
+        const webpage = url.includes(ytId) ? url.trim() : `https://www.youtube.com/watch?v=${ytId}`;
+        setInfo({
+          id: ytId,
+          title: vd?.title || "YouTube video",
+          channel: vd?.author ?? null,
+          duration: d,
+          thumbnail: `https://i.ytimg.com/vi/${ytId}/hqdefault.jpg`,
+          viewCount: null,
+          uploadDate: null,
+          isLive: false,
+          chapters: null,
+          qualities: [],
+          webpageUrl: webpage,
+        });
+        setInfoError(null);
+        setStart(0);
+        setEnd(Math.min(30, d));
+        setQuality("best");
+        toast({
+          title: "Preview loaded from your browser",
+          description:
+            "YouTube blocked the server from indexing this video. Scrub the player and set your crop times — cutting will retry through alternate clients.",
+        });
+        return;
+      }
+      if (Date.now() - startedAt > 20000) {
+        clearInterval(iv);
+        setFallbackPending(false);
+        toast({
+          title: "Automatic preview not available",
+          description: "Use “Enter times manually” below and type the crop points yourself.",
+          variant: "destructive",
+        });
+      }
+    }, 400);
+    return () => clearInterval(iv);
+  }, [fallbackPending, ytId, url, toast]);
+
+  /* ------- preview the selected range inside the player ------- */
+
+  useEffect(() => {
+    if (!previewing) return;
+    const player = playerRef.current;
+    if (!player) {
+      setPreviewing(false);
+      return;
+    }
+    player.seekTo(start, true);
+    player.play();
+    const iv = setInterval(() => {
+      const t = player.getCurrentTime();
+      if (t >= end - 0.05) {
+        player.pause();
+        player.seekTo(start, false);
+        setPreviewing(false);
+      }
+    }, 250);
+    return () => clearInterval(iv);
+  }, [previewing, start, end]);
+
+  const enterManualMode = () => {
+    setManualMode(true);
+    setFallbackPending(false);
+    setServerBlocked(false);
+    setPreviewing(false);
+    setInfoError(null);
+    setInfo({
+      id: null,
+      title: "Manual clip",
+      channel: null,
+      duration: 14400,
+      thumbnail: null,
+      viewCount: null,
+      uploadDate: null,
+      isLive: false,
+      chapters: null,
+      qualities: [],
+      webpageUrl: url.trim(),
+    });
+    setStart(0);
+    setEnd(30);
+    setQuality("best");
+    toast({
+      title: "Manual mode",
+      description: "Type the crop points below (e.g. 2:20:00 and 2:40:00) and press Cut.",
+    });
   };
 
   /* ---------------- time sync ---------------- */
@@ -497,11 +617,27 @@ export default function Home() {
                     <Button size="sm" onClick={() => setCookiesOpen(true)} className="gap-2 bg-gradient-to-r from-red-500 to-orange-500 text-white hover:opacity-90">
                       <KeyRound className="h-4 w-4" aria-hidden /> Add browser cookies
                     </Button>
+                    <Button size="sm" variant="outline" onClick={enterManualMode} className="gap-2">
+                      <PencilLine className="h-4 w-4" aria-hidden /> Enter times manually
+                    </Button>
                     <span className="py-1.5 text-xs text-muted-foreground">or try again — it can be a transient rate-limit.</span>
                   </div>
                 )}
               </AlertDescription>
             </Alert>
+
+            {/* The preview still streams from YouTube inside the browser even when the
+                server is bot-walled — attach the player so the crop tools can use it. */}
+            {infoError.code === "bot_check" && ytId && (
+              <div className="mt-4 space-y-2">
+                <YtPlayer ref={playerRef} videoId={ytId} />
+                {fallbackPending && (
+                  <p className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> Waiting for the player so the crop tools can attach…
+                  </p>
+                )}
+              </div>
+            )}
           </section>
         )}
 
@@ -540,9 +676,11 @@ export default function Home() {
                         <Clapperboard className="h-10 w-10 text-muted-foreground" aria-hidden />
                       </div>
                     )}
-                    <Badge className="absolute bottom-2 right-2 bg-black/80 text-white tabular-nums">
-                      {fmtClock(info.duration)}
-                    </Badge>
+                    {!manualMode && (
+                      <Badge className="absolute bottom-2 right-2 bg-black/80 text-white tabular-nums">
+                        {fmtClock(info.duration)}
+                      </Badge>
+                    )}
                   </div>
                   {/* meta */}
                   <div className="min-w-0">
@@ -608,7 +746,18 @@ export default function Home() {
             {/* clip editor */}
             <Card className="border-border/60 shadow-sm">
               <CardContent className="space-y-5 p-4 sm:p-6">
-                {ytId && (
+                {serverBlocked && (
+                  <Alert className="border-amber-500/50 bg-amber-500/10">
+                    <TriangleAlert className="h-4 w-4" aria-hidden />
+                    <AlertDescription className="text-xs leading-relaxed">
+                      Preview &amp; times come straight from your browser. The server itself is blocked by YouTube
+                      from indexing this video, so cutting will auto-retry with alternate clients — if it still
+                      fails, add cookies in Settings or run fclip on your own machine.
+                    </AlertDescription>
+                  </Alert>
+                )}
+
+                {ytId && !manualMode && (
                   <div className="space-y-2">
                     <YtPlayer ref={playerRef} videoId={ytId} />
                     <div className="flex flex-wrap gap-2">
@@ -618,18 +767,31 @@ export default function Home() {
                       <Button type="button" variant="outline" size="sm" onClick={() => grabPlayerTime("end")} className="gap-1.5">
                         <Timer className="h-3.5 w-3.5 text-orange-500" aria-hidden /> Set end to player time
                       </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setPreviewing((v) => !v)}
+                        disabled={previewing ? false : !info || end <= start}
+                        className="gap-1.5"
+                      >
+                        {previewing ? <Square className="h-3.5 w-3.5 text-foreground" aria-hidden /> : <Play className="h-3.5 w-3.5 text-emerald-500" aria-hidden />}
+                        {previewing ? "Stop preview" : "Preview selection"}
+                      </Button>
                       <span className="py-1 text-xs text-muted-foreground">Scrub the video above, then grab the exact second here.</span>
                     </div>
                   </div>
                 )}
 
-                <Timeline
-                  duration={duration || 60}
-                  start={start}
-                  end={end}
-                  chapters={info.chapters}
-                  onChange={applyRange}
-                />
+                {!manualMode && (
+                  <Timeline
+                    duration={duration || 60}
+                    start={start}
+                    end={end}
+                    chapters={info.chapters}
+                    onChange={applyRange}
+                  />
+                )}
 
                 {/* precise time inputs */}
                 <div className="grid gap-3 sm:grid-cols-[1fr_1fr_auto] sm:items-end">
@@ -667,6 +829,11 @@ export default function Home() {
                     </div>
                   </div>
                 </div>
+
+                <p className="-mt-1 text-xs text-muted-foreground">
+                  Accepts <code className="rounded bg-muted px-1">90</code>, <code className="rounded bg-muted px-1">1:30</code> or{" "}
+                  <code className="rounded bg-muted px-1">2:20:00</code> (h:mm:ss).
+                </p>
 
                 {clipInvalid && (
                   <p className="text-xs text-red-500">The end time must be after the start time.</p>
