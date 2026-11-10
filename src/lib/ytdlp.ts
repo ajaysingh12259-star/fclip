@@ -2,11 +2,14 @@ import { spawn, execFile, execFileSync, type ChildProcess } from "child_process"
 import { promisify } from "util";
 
 const execFileAsync = promisify(execFile);
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, rmSync, writeFileSync, createWriteStream } from "fs";
+import { Readable } from "stream";
+import { pipeline } from "stream/promises";
 import path from "path";
 import { randomUUID } from "crypto";
 import {
   fetchRelayInfo,
+  fetchCobaltTunnel,
   pickRelayMedia,
   extractVideoId,
   type RelayFormat,
@@ -145,18 +148,23 @@ const g = globalThis as unknown as {
   __fclipStormClient: { at: number; client: string } | undefined;
   __fclipProxyOk: { at: number; ok: boolean } | undefined;
   __fclipEngine: { at: number; status: EngineStatus } | undefined;
-  __fclipRelay: { at: number; videoId: string; formats: RelayFormat[] } | undefined;
+  __fclipRelay: { at: number; videoId: string; formats: RelayFormat[]; duration: number | null } | undefined;
 };
 
 /* Relay formats from the last successful relay fetch — the clip job reuses
  * them (30 min TTL) so a video that fell back to the relay tier for info
  * also cuts through the relay without a second fan-out. */
-function rememberRelayFormats(videoId: string, formats: RelayFormat[]) {
-  g.__fclipRelay = { at: Date.now(), videoId, formats };
+function rememberRelayFormats(videoId: string, formats: RelayFormat[], duration: number | null = null) {
+  g.__fclipRelay = { at: Date.now(), videoId, formats, duration };
 }
 function cachedRelayFormats(videoId: string): RelayFormat[] | null {
   const r = g.__fclipRelay;
   if (r && r.videoId === videoId && Date.now() - r.at < 30 * 60_000) return r.formats;
+  return null;
+}
+function cachedRelayDuration(videoId: string): number | null {
+  const r = g.__fclipRelay;
+  if (r && r.videoId === videoId && Date.now() - r.at < 30 * 60_000) return r.duration;
   return null;
 }
 
@@ -727,7 +735,7 @@ export async function fetchInfo(url: string): Promise<{ ok: true; info: VideoInf
       const videoId = extractVideoId(url);
       const relay = videoId ? await fetchRelayInfo(videoId) : null;
       if (relay) {
-        rememberRelayFormats(relay.id, relay.formats);
+        rememberRelayFormats(relay.id, relay.formats, relay.duration);
         return { ok: true, info: relayToVideoInfo(relay, url) };
       }
     }
@@ -1052,7 +1060,7 @@ export function createClipJob(params: CreateJobParams): ClipJob {
       if (!formats && videoId) {
         const relay = await fetchRelayInfo(videoId);
         if (relay) {
-          rememberRelayFormats(relay.id, relay.formats);
+          rememberRelayFormats(relay.id, relay.formats, relay.duration);
           formats = relay.formats;
         }
       }
@@ -1084,9 +1092,11 @@ export function createClipJob(params: CreateJobParams): ClipJob {
 }
 
 /**
- * Cookie-less relay cut: ffmpeg reads the instance-proxied media URLs over
- * HTTP and writes the selected time range with stream copy (fast, lossless).
- * Used when yt-dlp is walled AND no relay-hostile combination helped.
+ * Cookie-less relay cut. Preferred byte path: a Cobalt relay tunnels the
+ * media through its own server so ANY IP can download it (measured live —
+ * every public Piped byte-proxy 403s, the cobalt tunnel returns 200 with
+ * valid mp4). Full media is downloaded once, then ffmpeg stream-copies the
+ * selected range locally. Fallback: instance-proxied googlevideo URLs.
  */
 async function relayCut(
   job: ClipJob,
@@ -1094,9 +1104,40 @@ async function relayCut(
   formats: RelayFormat[],
   params: CreateJobParams
 ): Promise<void> {
+  const dur = Math.max(0.2, params.end - params.start);
+  const videoLen = cachedRelayDuration(extractVideoId(params.url) ?? "");
+  // Tunneling means downloading the whole video once — only sane up to ~45 min.
+  const cobaltAllowed = videoLen === null || videoLen <= 45 * 60;
+  if (cobaltAllowed && isYouTubeUrl(params.url)) {
+    const cobalt = await fetchCobaltTunnel(params.url, params.maxHeight).catch(() => null);
+    if (cobalt) {
+      const full = path.join(dir, "source.mp4");
+      job.status = "running";
+      job.stage = "Relay: downloading through cobalt tunnel";
+      job.log.push(`[fclip] cobalt relay (${cobalt.host}) — fetching media bytes…`);
+      const ok = await downloadTunnelFile(job, cobalt.url, full);
+      if (ok) {
+        job.stage = "Relay: cutting locally";
+        job.progress = 95;
+        await ffmpegLocalCut(job, full, params.start, dur, dir);
+        try {
+          rmSync(full, { force: true });
+        } catch {
+          /* best effort */
+        }
+        return;
+      }
+      try {
+        rmSync(full, { force: true });
+      } catch {
+        /* best effort */
+      }
+      job.log.push("[fclip] cobalt tunnel download failed — trying instance byte-proxy…");
+    }
+  }
+
   const { video, audio } = pickRelayMedia(formats, params.maxHeight);
   if (!video) throw new Error("no cuttable media stream in the relay response");
-  const dur = Math.max(0.2, params.end - params.start);
   const out = path.join(dir, "clip.mp4");
 
   const args = ["-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-y"];
@@ -1153,6 +1194,74 @@ async function relayCut(
       if ((job.status as string) === "canceled") return resolve();
       if (code === 0) resolve();
       else reject(new Error(`relay ffmpeg exited ${code}`));
+    });
+  });
+  if ((job.status as string) === "canceled") return;
+  job.stage = "Processing with ffmpeg";
+  job.progress = 100;
+}
+
+/** Stream a tunnel URL to disk with download progress (0–90%). */
+async function downloadTunnelFile(job: ClipJob, url: string, dest: string): Promise<boolean> {
+  try {
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(15 * 60_000),
+      headers: { "user-agent": "Mozilla/5.0 (X11; Linux x86_64) fclip/1.0" },
+      redirect: "follow",
+    });
+    if (!res.ok || !res.body) return false;
+    const total = Number(res.headers.get("content-length") ?? "0");
+    let got = 0;
+    const counter = new TransformStream<Uint8Array, Uint8Array>({
+      transform(chunk, ctrl) {
+        got += chunk.byteLength;
+        if (total > 0) job.progress = Math.min(90, Math.round((got / total) * 90));
+        else job.progress = Math.min(85, Math.round(got / 2_000_000));
+        ctrl.enqueue(chunk);
+      },
+    });
+    await pipeline(
+      Readable.fromWeb(res.body.pipeThrough(counter) as Parameters<typeof Readable.fromWeb>[0]),
+      createWriteStream(dest)
+    );
+    return got > 0;
+  } catch (e) {
+    if ((job.status as string) !== "canceled") {
+      const msg = e instanceof Error ? e.message : String(e);
+      job.log.push(`[fclip] tunnel download error: ${msg.slice(0, 160)}`);
+    }
+    return false;
+  }
+}
+
+/** Stream-copy the selected range out of a local file (fast, lossless). */
+async function ffmpegLocalCut(job: ClipJob, src: string, start: number, dur: number, dir: string): Promise<void> {
+  const out = path.join(dir, "clip.mp4");
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(
+      FFMPEG,
+      [
+        "-hide_banner", "-loglevel", "error", "-nostats", "-y",
+        "-ss", String(start),
+        "-i", src,
+        "-t", String(dur),
+        "-c", "copy",
+        "-movflags", "faststart",
+        out,
+      ],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+    job.proc = child;
+    let err = "";
+    child.stderr?.on("data", (d) => {
+      err += d.toString();
+      if (err.length > 4000) err = err.slice(-4000);
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if ((job.status as string) === "canceled") return resolve();
+      if (code === 0) resolve();
+      else reject(new Error(`local cut ffmpeg exited ${code}: ${err.trim().slice(-180)}`));
     });
   });
   if ((job.status as string) === "canceled") return;

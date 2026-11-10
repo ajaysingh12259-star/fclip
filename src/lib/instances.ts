@@ -69,6 +69,8 @@ const INVIDIOUS_HOSTS = [
   "invidious.materialio.us",
 ];
 
+const COBALT_HOSTS = ["co.otomir23.me", "dwnld.nichind.dev"];
+
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const HEALTH_TTL_MS = 15 * 60 * 1000;
 
@@ -133,6 +135,73 @@ async function fetchJson(url: string, timeoutMs: number): Promise<unknown | null
   } catch {
     return null;
   }
+}
+
+async function fetchJsonPost(url: string, body: string, timeoutMs: number): Promise<unknown | null> {
+  const secs = Math.max(3, Math.ceil(timeoutMs / 1000));
+  if (await curlAvailable()) {
+    try {
+      const { stdout } = await execFileAsync(
+        "curl",
+        [
+          "-sS", "--fail", "--max-time", String(secs),
+          "-X", "POST",
+          "-H", "Accept: application/json",
+          "-H", "Content-Type: application/json",
+          "-H", "User-Agent: Mozilla/5.0 (X11; Linux x86_64) fclip/1.0",
+          "-d", body,
+          url,
+        ],
+        { timeout: timeoutMs + 3000, maxBuffer: 4 * 1024 * 1024, encoding: "utf8" }
+      );
+      return JSON.parse(stdout) as unknown;
+    } catch {
+      return null;
+    }
+  }
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      signal: AbortSignal.timeout(timeoutMs),
+      headers: {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "user-agent": "Mozilla/5.0 (X11; Linux x86_64) fclip/1.0",
+      },
+      body,
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as unknown;
+  } catch {
+    return null;
+  }
+}
+
+export interface CobaltMedia {
+  url: string;
+  host: string;
+}
+
+/**
+ * Ask a Cobalt relay instance to resolve the video. Cobalt answers with a
+ * TUNNEL URL that serves the media bytes through the instance's own server —
+ * any IP can download them (measured live: 200 + valid mp4 through
+ * co.otomir23.me while every Piped byte-proxy 403'd). This is the byte
+ * backbone of the cookie-less tier.
+ */
+export async function fetchCobaltTunnel(pageUrl: string, maxHeight: number | null): Promise<CobaltMedia | null> {
+  const quality = maxHeight && maxHeight > 0 ? String(Math.min(Math.round(maxHeight), 1080)) : "1080";
+  const body = JSON.stringify({ url: pageUrl, videoQuality: quality, downloadMode: "auto" });
+  for (const h of COBALT_HOSTS) {
+    const j = await fetchJsonPost(`https://${h}/`, body, 15_000);
+    const obj = j as { status?: string; url?: string } | null;
+    if (obj && (obj.status === "tunnel" || obj.status === "redirect") && typeof obj.url === "string" && obj.url) {
+      console.log(`[fclip-relay] cobalt ${h} → tunnel for ${pageUrl.slice(-20)}`);
+      return { url: obj.url, host: h };
+    }
+  }
+  console.log("[fclip-relay] no cobalt host produced a tunnel");
+  return null;
 }
 
 function isProxiedUrl(u: string): boolean {
