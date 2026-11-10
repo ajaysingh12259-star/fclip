@@ -17,6 +17,7 @@ import {
   type CobaltMedia,
 } from "@/lib/instances";
 import { vlCreateClip } from "@/lib/videolimit";
+import { savenowRender } from "@/lib/savenow";
 
 /* ------------------------------------------------------------------ */
 /* Paths                                                              */
@@ -730,7 +731,7 @@ function relayToVideoInfo(relay: RelayInfo, url: string): VideoInfo {
     qualities: qualitiesFinal,
     route: "relay",
     qualityHint: turbo
-      ? "Turbo HD active: the premium render farm now cuts your range in true 1080p60 (h264+aac) with zero cookies — measured live. 4K attempts ride 4K-capable tunnel relays (up to 2160p VP9); if every relay refuses, your clip still lands in 360p."
+      ? "Turbo HD active: the premium render farm cuts your range in true 1080p60 (h264+aac) with zero cookies. 4K picks ride the 4K relays — measured live at 3840x2160 (AV1 60fps): tunnel mirrors first, then a 4K render farm that processes the full source and hands back a finished 2160p file (best for sources ≤ 25 min). If every relay refuses, your clip still lands in 1080p60/360p."
       : "Served through fclip's cookie-less relay network (public Piped/Invidious instances) — no YouTube cookies involved. Relay quality usually tops out around 360–720p; for full 4K add cookies in Settings.",
     webpageUrl: url,
   };
@@ -1159,10 +1160,14 @@ async function relayCut(
   }
 
   // 2. HD: VideoLimit render relay (server-side cut, 1080p60 ceiling, free tier).
+  //    Skipped for explicit 1440p/4K requests — their ceiling is 1080p60 and
+  //    letting it run would silently downgrade a 4K pick (the 4K lanes below
+  //    would never fire).
   const videoId = extractVideoId(params.url);
   const videoLen = cachedRelayDuration(videoId ?? "");
   const clipLen = params.end - params.start;
-  if (wantHd && videoId && clipLen <= 10 * 60) {
+  const want4k = params.maxHeight != null && params.maxHeight >= 1440;
+  if (wantHd && !want4k && videoId && clipLen <= 10 * 60) {
     try {
       job.status = "running";
       job.stage = "Relay: rendering HD clip (1080p60)";
@@ -1185,7 +1190,12 @@ async function relayCut(
     }
   }
 
-  // 3. 1440p/4K attempts: tunnel relays (full download → local range cut).
+  // 3. 1440p/4K attempts: full-download relays (whole source once → local
+  //    range cut). Tunnel relays first (fast, direct re-serve); then the
+  //    savenow render farm — TRUE 2160p AV1+aac verified live, no cookies,
+  //    but it renders the WHOLE video and downloads at ~2 MB/s, so it is
+  //    capped at ~25 min sources and one attempt at a time (their per-IP
+  //    budget rejects bursts).
   const cobaltAllowed = videoLen === null || videoLen <= 45 * 60;
   const isYt = isYouTubeUrl(params.url);
   // Tunneling means downloading the whole video once — only sane up to ~45 min.
@@ -1214,6 +1224,61 @@ async function relayCut(
         /* best effort */
       }
       job.log.push(`[fclip] cobalt tunnel (${cobalt.host}) gave no bytes — trying next relay…`);
+    }
+  }
+
+  // 3b. 4K render relay (savenow / loader.to backend): alive when the tunnel
+  //     farm is walled. Renders the whole source in TRUE 2160p (3840x2160
+  //     AV1@60 + AAC, ffprobe-verified 2026-11-11), then we stream-copy the
+  //     range locally. Their "1440" dropdown value is server-unconfirmed, so
+  //     1440p picks render via 4k and every ≥1440 request falls back to it.
+  if (want4k && isYt && videoId && (videoLen === null || videoLen <= 25 * 60)) {
+    // 2160p pick: straight to the measured-good "4k" render. 1440p pick: try
+    // the smaller "1440" render first, fall back to "4k" on any refusal.
+    const formatsToTry: string[] = params.maxHeight! >= 2160 ? ["4k"] : ["1440", "4k"];
+    for (const fmt of formatsToTry) {
+      try {
+        job.status = "running";
+        job.stage = "Relay: rendering full source (4K farm)";
+        job.progress = 30;
+        job.log.push(
+          `[fclip] 4K render relay — queueing the full source for a ${fmt === "4k" ? "2160p" : "1440p"} render (no cookies)…`
+        );
+        const render = await savenowRender(videoId, fmt, {
+          timeoutMs: 10 * 60_000,
+          onProgress: (pct, text) => {
+            if (pct >= 0) job.progress = Math.min(60, 30 + Math.round(pct * 0.3));
+            if (text) job.stage = `Relay: rendering 4K (${text.slice(0, 40)})`;
+          },
+        });
+        job.log.push(`[fclip] render farm returned ${render.fullFormat} — downloading the full source…`);
+        job.stage = "Relay: downloading rendered source";
+        job.progress = 62;
+        const full = path.join(dir, `savenow-${videoId}.mp4`);
+        const ok = await downloadTunnelFile(job, render.url, full);
+        if (ok) {
+          job.stage = "Relay: cutting locally";
+          job.progress = 95;
+          await ffmpegLocalCut(job, full, params.start, dur, dir);
+          try {
+            rmSync(full, { force: true });
+          } catch {
+            /* best effort */
+          }
+          return;
+        }
+        try {
+          rmSync(full, { force: true });
+        } catch {
+          /* best effort */
+        }
+        job.log.push("[fclip] rendered source download failed — falling back…");
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        job.log.push(`[fclip] 4K render relay (${fmt}) unavailable: ${msg.slice(0, 120)}`);
+        if (fmt === "1440") continue; // try the measured-good "4k" value
+        break; // 4k already failed — do not burn another throttle window
+      }
     }
   }
 
