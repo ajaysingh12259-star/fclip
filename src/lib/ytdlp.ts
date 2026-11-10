@@ -227,7 +227,7 @@ function mwebClientArgs(): string[] {
  * claiming a different player identity, take the first breakthrough, kill
  * the rest, and persist the winner so later requests start from it.
  */
-const STORM_CLIENTS = ["android", "android_vr", "tv", "mweb"];
+const STORM_CLIENTS = ["android", "android_vr", "tv", "mweb", "web_embedded", "tv_embedded"];
 const STORM_PATH = path.join(DATA_DIR, "storm.json");
 
 function recordStormWinner(client: string): void {
