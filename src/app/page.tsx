@@ -74,6 +74,7 @@ interface VideoInfo {
   chapters: { start: number; end: number; title: string }[] | null;
   qualities: { height: number; tbr: number | null; ext: string }[];
   qualityHint?: string | null;
+  route?: "direct" | "storm" | "relay";
   webpageUrl: string;
 }
 
@@ -640,8 +641,9 @@ export default function Home() {
             </h1>
             <p className="mx-auto mt-4 max-w-2xl text-pretty text-sm leading-relaxed text-muted-foreground sm:text-base">
               Paste a link, pick the exact seconds, download just that part. fclip streams
-              <strong className="text-foreground"> only the byte-ranges it needs</strong> and falls back to its
-              relay network when YouTube walls the server — an account is never required.
+              <strong className="text-foreground"> only the byte-ranges it needs</strong> and, when YouTube walls the
+              server, switches to its <strong className="text-foreground">turbo relay backbone</strong> — an account
+              and cookies are never required.
             </p>
           </motion.div>
 
@@ -831,6 +833,30 @@ export default function Home() {
                     <div className="min-w-0">
                       <h2 className="line-clamp-2 text-base font-semibold leading-snug sm:text-lg">{info.title}</h2>
                       <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                        {info.route === "relay" && (
+                          <span
+                            className="inline-flex items-center gap-1 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-300"
+                            title="Served through fclip's cookie-less turbo relay — residential-egress extraction, byte proxy, no bot wall"
+                          >
+                            <Zap className="h-3 w-3" aria-hidden /> Turbo route
+                          </span>
+                        )}
+                        {info.route === "storm" && (
+                          <span
+                            className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300"
+                            title="YouTube was bypassed via a parallel player-identity burst — no cookies used"
+                          >
+                            <Zap className="h-3 w-3" aria-hidden /> Storm breakthrough
+                          </span>
+                        )}
+                        {(!info.route || info.route === "direct") && (
+                          <span
+                            className="inline-flex items-center gap-1 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-300"
+                            title="Fetched directly by the server — fastest path"
+                          >
+                            <ShieldCheck className="h-3 w-3" aria-hidden /> Direct
+                          </span>
+                        )}
                         {info.channel && (
                           <span className="inline-flex items-center gap-1.5">
                             <UserRound className="h-3.5 w-3.5" aria-hidden /> {info.channel}
@@ -894,7 +920,13 @@ export default function Home() {
                   )}
 
                   {info.qualityHint && (
-                    <p className="mt-3 rounded-lg border border-fuchsia-500/30 bg-fuchsia-500/[0.08] px-3 py-2 text-xs leading-relaxed text-fuchsia-300">
+                    <p
+                      className={`mt-3 rounded-lg border px-3 py-2 text-xs leading-relaxed ${
+                        info.route === "relay"
+                          ? "border-emerald-500/30 bg-emerald-500/[0.08] text-emerald-300"
+                          : "border-fuchsia-500/30 bg-fuchsia-500/[0.08] text-fuchsia-300"
+                      }`}
+                    >
                       <Wand2 className="mr-1 inline h-3.5 w-3.5" aria-hidden /> {info.qualityHint}
                     </p>
                   )}
@@ -1062,7 +1094,8 @@ export default function Home() {
                   <ol className="space-y-1.5 text-xs leading-relaxed text-muted-foreground">
                     <li><strong className="text-foreground">1 · Direct</strong> — yt-dlp with BotGuard PO tokens, no cookies.</li>
                     <li><strong className="text-foreground">2 · Storm</strong> — parallel player-identity bursts until one gets through.</li>
-                    <li><strong className="text-foreground">3 · Relay</strong> — public Piped/Invidious instances fetch &amp; proxy the bytes.</li>
+                    <li><strong className="text-foreground">3 · Turbo relay</strong> — residential-egress extraction + byte proxy. Zero cookies, beats the bot wall.</li>
+                    <li><strong className="text-foreground">4 · Community relays</strong> — public Piped/Invidious instances as backup.</li>
                     <li><strong className="text-foreground">Cookies</strong> — optional booster, never a requirement.</li>
                   </ol>
                 </CardContent>

@@ -134,6 +134,8 @@ export interface VideoInfo {
   qualities: { height: number; tbr: number | null; ext: string }[];
   /** Set when extraction only succeeded via the bot-wall storm (no cookies): quality may be capped. */
   qualityHint?: string | null;
+  /** Which pipeline served this info: direct yt-dlp, bot-wall storm, or cookie-less relay. */
+  route?: "direct" | "storm" | "relay";
   webpageUrl: string;
 }
 
@@ -704,6 +706,7 @@ function relayToVideoInfo(relay: RelayInfo, url: string): VideoInfo {
     }
   }
   const qualities = [...heights.values()].sort((a, b) => b.height - a.height).slice(0, 8);
+  const turbo = relay.source === "clipscutter";
   return {
     id: relay.id,
     title: relay.title,
@@ -715,8 +718,10 @@ function relayToVideoInfo(relay: RelayInfo, url: string): VideoInfo {
     isLive: false,
     chapters: null,
     qualities,
-    qualityHint:
-      "Served through fclip's cookie-less relay network (public Piped/Invidious instances) — no YouTube cookies involved. Relay quality usually tops out around 360–720p; for full 4K add cookies in Settings.",
+    route: "relay",
+    qualityHint: turbo
+      ? "Turbo route active: this video is served through fclip's cookie-less relay backbone (residential-egress extraction + byte proxy). No YouTube cookies involved and no bot wall — quality is capped around 360p on this route; cookies in Settings unlock full HD."
+      : "Served through fclip's cookie-less relay network (public Piped/Invidious instances) — no YouTube cookies involved. Relay quality usually tops out around 360–720p; for full 4K add cookies in Settings.",
     webpageUrl: url,
   };
 }
@@ -785,6 +790,7 @@ export async function fetchInfo(url: string): Promise<{ ok: true; info: VideoInf
       .filter((c) => typeof c.start_time === "number" && typeof c.end_time === "number")
       .map((c) => ({ start: c.start_time as number, end: c.end_time as number, title: c.title ?? "Chapter" })),
     qualities,
+    route: res.stormClient ? "storm" : "direct",
     qualityHint:
       res.stormClient && getCookiesMode() === "none"
         ? "This clip was extracted through the bot-wall storm — YouTube may cap quality at ~360p for servers without login cookies. Upload your cookies in Settings for full HD."
@@ -1093,11 +1099,30 @@ export function createClipJob(params: CreateJobParams): ClipJob {
 }
 
 /**
- * Cookie-less relay cut. Preferred byte path: a Cobalt relay tunnels the
- * media through its own server so ANY IP can download it (measured live —
- * every public Piped byte-proxy 403s, the cobalt tunnel returns 200 with
- * valid mp4). Full media is downloaded once, then ffmpeg stream-copies the
- * selected range locally. Fallback: instance-proxied googlevideo URLs.
+ * 1 KB range probe — true when this URL serves real bytes to whoever asks
+ * (any IP, no cookies). Distinguishes the clipscutter byte proxy (measured
+ * HTTP 206 from a datacenter IP) from Piped proxies that 403 ranged reads.
+ */
+async function urlServesBytes(url: string): Promise<boolean> {
+  try {
+    const { stdout } = await execFileAsync(
+      "curl",
+      ["-sS", "-L", "--fail", "--max-time", "15", "-r", "0-1023", "-o", "/dev/null", "-w", "%{http_code}", url],
+      { timeout: 20_000, encoding: "utf8" }
+    );
+    const code = Number.parseInt(stdout.trim(), 10);
+    return code === 200 || code === 206;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Cookie-less relay cut. Preferred byte path: a proxied progressive URL that
+ * passes a live range probe (the clipscutter turbo relay) — ffmpeg then
+ * streams ONLY the byte-ranges the clip needs, no full download. Fallback:
+ * a Cobalt relay tunnels the full media through its own server so ANY IP can
+ * download it. Last resort: instance-proxied googlevideo URLs.
  */
 async function relayCut(
   job: ClipJob,
@@ -1106,6 +1131,28 @@ async function relayCut(
   params: CreateJobParams
 ): Promise<void> {
   const dur = Math.max(0.2, params.end - params.start);
+  const out = path.join(dir, "clip.mp4");
+
+  // Turbo fast path: proxied progressive stream + verified ranged access →
+  // cut straight off the remote stream (only downloads ~the clip length).
+  if (formats) {
+    const pick = pickRelayMedia(formats, params.maxHeight);
+    const turboVideo = pick.video;
+    if (turboVideo && turboVideo.kind === "progressive" && turboVideo.proxied) {
+      job.status = "running";
+      job.stage = "Relay: probing turbo stream";
+      job.log.push("[fclip] probing the turbo relay for ranged byte access…");
+      const ok = await urlServesBytes(turboVideo.url);
+      if (ok) {
+        job.stage = "Relay: streaming cut via turbo proxy";
+        job.log.push("[fclip] turbo relay verified — cutting directly from the ranged stream…");
+        await ffmpegRelayUrlCut(job, { video: turboVideo, audio: pick.audio }, params, dur, out);
+        return;
+      }
+      job.log.push("[fclip] turbo relay refused ranged reads — falling back to tunnel relays…");
+    }
+  }
+
   const videoLen = cachedRelayDuration(extractVideoId(params.url) ?? "");
   // Tunneling means downloading the whole video once — only sane up to ~45 min.
   const cobaltAllowed = videoLen === null || videoLen <= 45 * 60;
@@ -1139,8 +1186,21 @@ async function relayCut(
 
   const { video, audio } = formats ? pickRelayMedia(formats, params.maxHeight) : { video: undefined, audio: undefined };
   if (!video) throw new Error("relay network had no media for this video");
-  const out = path.join(dir, "clip.mp4");
+  await ffmpegRelayUrlCut(job, { video, audio }, params, dur, out);
+  if ((job.status as string) === "canceled") return;
+  job.stage = "Processing with ffmpeg";
+  job.progress = 100;
+}
 
+/** ffmpeg stream-copy cut straight from remote URL(s) with progress parsing. */
+async function ffmpegRelayUrlCut(
+  job: ClipJob,
+  pick: { video: RelayFormat; audio?: RelayFormat },
+  params: CreateJobParams,
+  dur: number,
+  out: string
+): Promise<void> {
+  const { video, audio } = pick;
   const args = ["-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-y"];
   // -ss before each -i seeks that input; -t bounds the output duration.
   args.push("-ss", String(params.start), "-i", video.url);
