@@ -26,6 +26,7 @@ RUN apt-get update \
  && chmod +x /usr/local/bin/deno && rm -f /tmp/deno.zip \
  && git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil \
  && cd /opt/bgutil/server \
+ && DENO_DIR=/opt/deno-cache deno install \
  && DENO_DIR=/opt/deno-cache deno cache src/main.ts \
  && deno --version
 
