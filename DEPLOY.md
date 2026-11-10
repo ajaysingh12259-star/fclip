@@ -118,18 +118,23 @@ This repo ships a `render.yaml` blueprint:
 Cloud IPs get rate-limited by YouTube. fclip already fights back for you:
 
 1. **Built-in retry** — info fetches and cuts automatically retry once with YouTube's
-   `tv`/`android_vr` player clients, which usually skip the wall. Fresh deployments
+   `tv`/`android_vr` player clients, and once more with a fresh session. Fresh deployments
    often work with zero setup — just try the link again.
-2. **Preview always works** — the video preview streams from YouTube inside *your*
+2. **Built-in PO-token provider** — the Docker image runs the
+   [bgutil BotGuard provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+   on `localhost:4416` automatically. It mints the PO tokens YouTube demands from
+   server IPs — the same mechanism YoutubeDownloader uses internally — so Docker
+   deployments can fetch videos with zero setup.
+3. **Preview always works** — the video preview streams from YouTube inside *your*
    browser (never through the server), so even on a bot-walled server you can scrub,
    use *Set start/end to player time*, and *Preview selection*. fclip shows a yellow
    banner when it's in this mode.
-3. **Paste cookies** — Cookies button (header) accepts a standard `cookies.txt` export.
-4. **Cookies-from-browser env** — see the local-run trick above (desktop only).
-5. **Cookies via env var** — set `FCLIP_YT_COOKIES` to the full `cookies.txt`
+4. **Paste cookies** — Cookies button (header) accepts a standard `cookies.txt` export.
+5. **Cookies-from-browser env** — see the local-run trick above (desktop only).
+6. **Cookies via env var** — set `FCLIP_YT_COOKIES` to the full `cookies.txt`
    content (Netscape format); fclip materializes it at boot. Best option for
    Railway / Render / Fly / VPS where there is no local browser.
-6. **Run locally** — your home IP is the most reliable path; see section 1.
+7. **Run locally** — your home IP is the most reliable path; see section 1.
 
 > ⚠️ Cookie safety (per the yt-dlp wiki): use a **throwaway Google account** when
 > exporting cookies, not your main one — Google occasionally restricts accounts whose

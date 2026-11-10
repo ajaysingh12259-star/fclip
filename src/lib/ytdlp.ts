@@ -132,6 +132,7 @@ const g = globalThis as unknown as {
   __fclipJobs: Map<string, ClipJob> | undefined;
   __fclipOptArgsOk: boolean | undefined;
   __fclipTvClientOk: boolean | undefined;
+  __fclipMwebOk: boolean | undefined;
   __fclipEngine: { at: number; status: EngineStatus } | undefined;
 };
 
@@ -150,12 +151,16 @@ function setOptArgsOk(v: boolean) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Optional flags that improve compatibility but may not exist on older
- * yt-dlp versions. If yt-dlp rejects them we retry once without them.
+ * Previously we forced --js-runtimes bun + --remote-components ejs:github here.
+ * Testing against YouTube's bot wall showed that forcing a JS runtime makes
+ * yt-dlp prefer token-gated clients WITHOUT a working PO-token provider, which
+ * *worsened* survival from datacenter IPs. The default client cascade plus the
+ * bgutil PO-token provider (baked into the Docker image) performs best, so
+ * these flags are gone. Everything here stays optional for old yt-dlp versions.
  */
 function optionalArgs(): string[][] {
   if (!getOptArgsOk()) return [];
-  return [["--js-runtimes", "bun"], ["--remote-components", "ejs:github"]];
+  return [];
 }
 
 function impersonateArgs(): string[] {
@@ -190,10 +195,21 @@ export function isYouTubeUrl(url: string): boolean {
  * once before giving up so a fresh deployment can work with zero setup.
  */
 const BOT_WALL_RE = /sign in to confirm|not a bot|bot check/i;
+const GVS_403_RE = /HTTP error 403|Server returned 403|Forbidden[\s\S]*googlevideo|googlevideo[\s\S]*403/i;
 
 function tvClientArgs(): string[] {
   if (g.__fclipTvClientOk === false) return [];
   return ["--extractor-args", "youtube:player_client=tv,android_vr"];
+}
+
+/**
+ * The `mweb` client works together with the bgutil PO-token provider for BOTH
+ * the player request and the googlevideo media bytes (the tv/android_vr
+ * clients can resolve metadata but their GVS URLs 403 without tokens).
+ */
+function mwebClientArgs(): string[] {
+  if (g.__fclipMwebOk === false) return [];
+  return ["--extractor-args", "youtube:player_client=mweb"];
 }
 
 function cookieArgs(): string[] {
@@ -264,6 +280,31 @@ async function runYtDlp(args: string[], timeoutMs: number, url?: string): Promis
     if (/invalid choice|unrecognized|no such option/i.test(r3.stderr + r3.stdout)) {
       g.__fclipTvClientOk = false; // yt-dlp too old for these clients — stop trying
     }
+  }
+  // Token-gated mweb client — with the bgutil PO-token provider this passes
+  // both the player check and the googlevideo byte-range requests.
+  if (
+    r.code !== 0 &&
+    (BOT_WALL_RE.test(r.stderr + r.stdout) || GVS_403_RE.test(r.stderr + r.stdout)) &&
+    isYouTubeUrl(url ?? "") &&
+    mwebClientArgs().length > 0
+  ) {
+    const r5 = await runOnce(getOptArgsOk(), false, [...args, ...mwebClientArgs()], timeoutMs);
+    if (r5.code === 0) {
+      g.__fclipMwebOk = true;
+      return r5;
+    }
+    if (/invalid choice|unrecognized|no such option/i.test(r5.stderr + r5.stdout)) {
+      g.__fclipMwebOk = false;
+    }
+  }
+  // Final attempt: PO tokens are minted per request by the bgutil provider and
+  // the bot wall is probabilistic on soft-flagged IPs — a fresh plain attempt
+  // after a short pause often passes.
+  if (r.code !== 0 && BOT_WALL_RE.test(r.stderr + r.stdout) && isYouTubeUrl(url ?? "")) {
+    await new Promise((res) => setTimeout(res, 1500));
+    const r4 = await runOnce(getOptArgsOk(), false, args, timeoutMs);
+    if (r4.code === 0) return r4;
   }
   return r;
 }
@@ -350,6 +391,13 @@ export function classifyError(stderrTail: string): { code: string; message: stri
       code: "bot_check",
       message:
         "YouTube is asking this server to verify it is not a bot (common for cloud IPs). You can fix this by adding your browser cookies below, or run fclip locally where your own IP is used.",
+    };
+  }
+  if (s.includes("server returned 403") || s.includes("http error 403")) {
+    return {
+      code: "stream_blocked",
+      message:
+        "YouTube refused to serve the media stream (403). The PO-token session did not cover it — try again, or add your cookies in Settings for a guaranteed path.",
     };
   }
   if (s.includes("video unavailable") || s.includes("not available")) {
@@ -521,7 +569,9 @@ export function createClipJob(params: CreateJobParams): ClipJob {
     return child;
   };
 
+  let retriedMweb = false;
   let retriedTvClient = false;
+  let retriedPlain = false;
   let child = attempt([], "Resolving video streams");
 
   const pushLine = (line: string) => {
@@ -573,6 +623,34 @@ export function createClipJob(params: CreateJobParams): ClipJob {
       return;
     }
     const combined = job.log.join(" ") + stderrBuf;
+    // Bot wall or missing GVS token — retry with the token-gated mweb client,
+    // which the bgutil PO-token provider can fully satisfy.
+    if (
+      !retriedMweb &&
+      (BOT_WALL_RE.test(combined) || GVS_403_RE.test(combined)) &&
+      isYouTubeUrl(params.url) &&
+      mwebClientArgs().length > 0
+    ) {
+      retriedMweb = true;
+      job.log.push("[fclip] Bot wall / stream block — retrying with PO-token session…");
+      stdoutBuf = "";
+      stderrBuf = "";
+      child = attempt(mwebClientArgs(), "Retrying with PO-token session");
+      child.stdout?.on("data", (d) => {
+        stdoutBuf += d.toString();
+        const parts = stdoutBuf.split("\n");
+        stdoutBuf = parts.pop() ?? "";
+        parts.forEach(pushLine);
+      });
+      child.stderr?.on("data", (d) => {
+        stderrBuf += d.toString();
+        const parts = stderrBuf.split("\n");
+        stderrBuf = parts.pop() ?? "";
+        parts.forEach((p) => pushLine(p));
+      });
+      child.on("close", onClose);
+      return;
+    }
     // YouTube bot wall mid-download — one retry with tv/android_vr clients.
     if (!retriedTvClient && BOT_WALL_RE.test(combined) && isYouTubeUrl(params.url) && tvClientArgs().length > 0) {
       retriedTvClient = true;
@@ -593,6 +671,32 @@ export function createClipJob(params: CreateJobParams): ClipJob {
         parts.forEach((p) => pushLine(p));
       });
       child.on("close", onClose);
+      return;
+    }
+    // Final chance: the PO-token provider mints fresh tokens per request and
+    // the wall is probabilistic — one more plain attempt after a pause.
+    if (!retriedPlain && BOT_WALL_RE.test(combined) && isYouTubeUrl(params.url)) {
+      retriedPlain = true;
+      job.log.push("[fclip] Bot wall persists — trying once more with a fresh session…");
+      stdoutBuf = "";
+      stderrBuf = "";
+      setTimeout(() => {
+        if (job.status === "canceled") return;
+        child = attempt([], "Retrying with a fresh session");
+        child.stdout?.on("data", (d) => {
+          stdoutBuf += d.toString();
+          const parts = stdoutBuf.split("\n");
+          stdoutBuf = parts.pop() ?? "";
+          parts.forEach(pushLine);
+        });
+        child.stderr?.on("data", (d) => {
+          stderrBuf += d.toString();
+          const parts = stderrBuf.split("\n");
+          stderrBuf = parts.pop() ?? "";
+          parts.forEach((p) => pushLine(p));
+        });
+        child.on("close", onClose);
+      }, 2000);
       return;
     }
     job.status = "error";
