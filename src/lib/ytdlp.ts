@@ -136,6 +136,7 @@ const g = globalThis as unknown as {
   __fclipTvClientOk: boolean | undefined;
   __fclipMwebOk: boolean | undefined;
   __fclipStormClient: { at: number; client: string } | undefined;
+  __fclipProxyOk: { at: number; ok: boolean } | undefined;
   __fclipEngine: { at: number; status: EngineStatus } | undefined;
 };
 
@@ -227,8 +228,63 @@ function mwebClientArgs(): string[] {
  * claiming a different player identity, take the first breakthrough, kill
  * the rest, and persist the winner so later requests start from it.
  */
-const STORM_CLIENTS = ["android", "android_vr", "tv", "mweb", "web_embedded", "tv_embedded"];
+const STORM_CLIENTS = ["android", "android_vr", "tv_downgraded", "tv", "mweb", "web_safari"];
 const STORM_PATH = path.join(DATA_DIR, "storm.json");
+
+/* ------------------------------------------------------------------ */
+/* Cloudflare WARP egress (socks5 sidecar)                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Raw datacenter IPs get hard-flagged by YouTube's bot scoring; egress
+ * through Cloudflare's WARP network scores far better (the approach used in
+ * production by yt-dlp-rescue). The container entrypoint runs a wireproxy
+ * socks5 sidecar on 127.0.0.1:1080 when WARP is reachable; we probe it and
+ * route YouTube attempts through it. Disable with FCLIP_WARP_PROXY="".
+ */
+const WARP_PROXY = process.env.FCLIP_WARP_PROXY ?? "socks5h://127.0.0.1:1080";
+
+async function probeProxy(hold: number): Promise<boolean> {
+  // End-to-end check: an open socks5 port is NOT enough — the wireguard
+  // tunnel behind it can be dead (UDP egress blocked), which would silently
+  // hang every request routed through it. Verify a real HTTPS fetch works.
+  if (!WARP_PROXY) return false;
+  const target = WARP_PROXY.replace(/^socks5h?:\/\//, "");
+  try {
+    await execFileAsync(
+      "curl",
+      ["-s", "--socks5-hostname", target, "-m", String(Math.max(2, Math.ceil(hold / 1000))), "https://api.ipify.org"],
+      { timeout: hold + 3000 }
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function warpProxyArgs(): Promise<string[]> {
+  if (!WARP_PROXY) return [];
+  const cached = g.__fclipProxyOk;
+  if (cached && Date.now() - cached.at < 60_000) {
+    return cached.ok ? ["--proxy", WARP_PROXY] : [];
+  }
+  const ok = await probeProxy(400);
+  console.log(`[fclip-warp] probe ${WARP_PROXY}: ${ok ? "healthy" : "dead"}`);
+  g.__fclipProxyOk = { at: Date.now(), ok };
+  return ok ? ["--proxy", WARP_PROXY] : [];
+}
+
+/** Sync cache-only read for contexts that cannot await (job retry handlers). */
+function warpProxyArgsSync(): string[] {
+  if (!WARP_PROXY) return [];
+  const cached = g.__fclipProxyOk;
+  return cached?.ok ? ["--proxy", WARP_PROXY] : [];
+}
+
+/** Diagnostics: is the WARP tunnel actually passing traffic end-to-end? */
+export async function warpHealth(): Promise<{ socks5: boolean }> {
+  return { socks5: await probeProxy(3000) };
+}
 
 function recordStormWinner(client: string): void {
   g.__fclipStormClient = { at: Date.now(), client };
@@ -268,11 +324,13 @@ interface StormResult {
 function stormAttempt(
   client: string,
   args: string[],
-  timeoutMs: number
+  timeoutMs: number,
+  extraArgs: string[] = []
 ): { promise: Promise<StormResult>; kill: () => void } {
   const full = [
     ...coreArgs(),
     ...cookieArgs(),
+    ...extraArgs,
     ...args,
     "--extractor-args",
     `youtube:player_client=${client}`,
@@ -320,6 +378,9 @@ function stormAttempt(
 
 async function stormBurst(args: string[], timeoutMs: number, rounds: number): Promise<StormResult | null> {
   const deadline = Date.now() + Math.min(Math.max(timeoutMs - 10_000, 60_000), 170_000);
+  // Even rounds (2, 4…) attack through the Cloudflare WARP sidecar when it is
+  // up — alternating identity AND egress multiplies the dice rolls.
+  const proxyArgs = await warpProxyArgs();
   for (let round = 1; round <= rounds; round++) {
     if (Date.now() >= deadline) break;
     // Round 1 starts with the last known breakthrough client, if any.
@@ -328,9 +389,12 @@ async function stormBurst(args: string[], timeoutMs: number, rounds: number): Pr
       preferred && round === 1
         ? [preferred, ...STORM_CLIENTS.filter((c) => c !== preferred)]
         : STORM_CLIENTS;
-    console.log(`[fclip-storm] round ${round}/${rounds}: ${clients.join(",")}`);
+    const egress = round % 2 === 0 && proxyArgs.length > 0 ? proxyArgs : [];
+    console.log(
+      `[fclip-storm] round ${round}/${rounds}: ${clients.join(",")}${egress.length ? " via WARP" : ""}`
+    );
     const attempts = clients.map((c) =>
-      stormAttempt(c, args, Math.max(20_000, deadline - Date.now()))
+      stormAttempt(c, args, Math.min(45_000, Math.max(20_000, deadline - Date.now())), egress)
     );
     // Wait for the FIRST breakthrough; kill every loser the moment it appears.
     const wrapped = attempts.map((a, i) => a.promise.then((r) => ({ i, ...r })));
@@ -431,6 +495,13 @@ async function runYtDlp(args: string[], timeoutMs: number, url?: string): Promis
   // Brute-force storm: parallel bursts of player-client identities until one
   // breaks through the wall (see the storm block comment for the data).
   if (r.code !== 0 && BOT_WALL_RE.test(r.stderr + r.stdout) && isYouTubeUrl(url ?? "")) {
+    // Cheap first shot through the Cloudflare WARP sidecar if it is running —
+    // a fresh Cloudflare egress IP passes where the raw datacenter IP walls.
+    const proxyArgs = await warpProxyArgs();
+    if (proxyArgs.length > 0) {
+      const rp = await runOnce(getOptArgsOk(), false, [...args, ...proxyArgs], Math.min(timeoutMs, 45_000));
+      if (rp.code === 0) return rp;
+    }
     const storm = await stormBurst(args, timeoutMs, 3);
     if (storm) return { ...storm.res, stormClient: storm.client };
   }
@@ -786,7 +857,10 @@ export function createClipJob(params: CreateJobParams): ClipJob {
       job.log.push(`[fclip] Bot wall — retrying download via the "${client}" client…`);
       stdoutBuf = "";
       stderrBuf = "";
-      child = attempt(["--extractor-args", `youtube:player_client=${client}`], `Retrying via ${client} client`);
+      child = attempt(
+        ["--extractor-args", `youtube:player_client=${client}`, ...warpProxyArgsSync()],
+        `Retrying via ${client} client`
+      );
       child.stdout?.on("data", (d) => {
         stdoutBuf += d.toString();
         const parts = stdoutBuf.split("\n");

@@ -28,7 +28,12 @@ RUN apt-get update \
  && cd /opt/bgutil/server \
  && DENO_DIR=/opt/deno-cache deno install \
  && DENO_DIR=/opt/deno-cache deno cache src/main.ts \
- && deno --version
+ && deno --version \
+ && curl -fsSL -o /usr/local/bin/wgcf https://github.com/ViRb3/wgcf/releases/download/v2.2.22/wgcf_2.2.22_linux_amd64 \
+ && chmod +x /usr/local/bin/wgcf \
+ && curl -fsSL -o /tmp/wireproxy.tar.gz https://github.com/windtf/wireproxy/releases/download/v1.1.3/wireproxy_linux_amd64.tar.gz \
+ && tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin wireproxy && chmod +x /usr/local/bin/wireproxy && rm -f /tmp/wireproxy.tar.gz \
+ && wgcf --version && wireproxy --version
 
 WORKDIR /app
 ENV NODE_ENV=production \
@@ -51,7 +56,8 @@ COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/docker-entrypoint.sh
 
 EXPOSE 3000
-# Entrypoint keeps the bgutil PO-token provider (port 4416) running in the
-# background — it mints YouTube BotGuard tokens so yt-dlp survives the
-# "confirm you're not a bot" wall from datacenter IPs — then serves fclip.
+# Entrypoint keeps the bgutil PO-token provider (port 4416) AND the Cloudflare
+# WARP socks5 sidecar (port 1080) running in the background: the provider mints
+# YouTube BotGuard tokens and the sidecar provides Cloudflare egress so yt-dlp
+# survives the "confirm you're not a bot" wall from datacenter IPs.
 CMD ["/app/docker-entrypoint.sh"]
