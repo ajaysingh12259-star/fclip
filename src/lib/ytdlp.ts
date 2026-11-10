@@ -9,11 +9,12 @@ import path from "path";
 import { randomUUID } from "crypto";
 import {
   fetchRelayInfo,
-  fetchCobaltTunnel,
+  fetchCobaltTunnels,
   pickRelayMedia,
   extractVideoId,
   type RelayFormat,
   type RelayInfo,
+  type CobaltMedia,
 } from "@/lib/instances";
 
 /* ------------------------------------------------------------------ */
@@ -1064,7 +1065,7 @@ export function createClipJob(params: CreateJobParams): ClipJob {
           formats = relay.formats;
         }
       }
-      if (formats) {
+      {
         job.log.push("[fclip] yt-dlp exhausted — switching to the cookie-less relay network…");
         job.stage = "Cutting via relay network";
         try {
@@ -1101,7 +1102,7 @@ export function createClipJob(params: CreateJobParams): ClipJob {
 async function relayCut(
   job: ClipJob,
   dir: string,
-  formats: RelayFormat[],
+  formats: RelayFormat[] | null,
   params: CreateJobParams
 ): Promise<void> {
   const dur = Math.max(0.2, params.end - params.start);
@@ -1109,9 +1110,9 @@ async function relayCut(
   // Tunneling means downloading the whole video once — only sane up to ~45 min.
   const cobaltAllowed = videoLen === null || videoLen <= 45 * 60;
   if (cobaltAllowed && isYouTubeUrl(params.url)) {
-    const cobalt = await fetchCobaltTunnel(params.url, params.maxHeight).catch(() => null);
-    if (cobalt) {
-      const full = path.join(dir, "source.mp4");
+    const tunnels = await fetchCobaltTunnels(params.url, params.maxHeight).catch(() => [] as CobaltMedia[]);
+    for (const cobalt of tunnels) {
+      const full = path.join(dir, `source-${cobalt.host}.mp4`);
       job.status = "running";
       job.stage = "Relay: downloading through cobalt tunnel";
       job.log.push(`[fclip] cobalt relay (${cobalt.host}) — fetching media bytes…`);
@@ -1132,12 +1133,12 @@ async function relayCut(
       } catch {
         /* best effort */
       }
-      job.log.push("[fclip] cobalt tunnel download failed — trying instance byte-proxy…");
+      job.log.push(`[fclip] cobalt tunnel (${cobalt.host}) gave no bytes — trying next relay…`);
     }
   }
 
-  const { video, audio } = pickRelayMedia(formats, params.maxHeight);
-  if (!video) throw new Error("no cuttable media stream in the relay response");
+  const { video, audio } = formats ? pickRelayMedia(formats, params.maxHeight) : { video: undefined, audio: undefined };
+  if (!video) throw new Error("relay network had no media for this video");
   const out = path.join(dir, "clip.mp4");
 
   const args = ["-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-y"];
@@ -1203,13 +1204,52 @@ async function relayCut(
 
 /** Stream a tunnel URL to disk with download progress (0–90%). */
 async function downloadTunnelFile(job: ClipJob, url: string, dest: string): Promise<boolean> {
+  // curl first — battle-tested against odd TLS/CDN setups and it streams
+  // straight to disk with parseable progress. Native fetch failed on large
+  // tunnel responses from Railway (measured live). If curl is missing the
+  // spawn fires "error" and we fall through to native fetch.
+  {
+    const ok = await new Promise<boolean>((resolve) => {
+      const child = spawn(
+        "curl",
+        ["-sS", "-L", "--fail", "--max-time", "900", "--retry", "2", "-#", "-o", dest, url],
+        { stdio: ["ignore", "ignore", "pipe"] }
+      );
+      job.proc = child;
+      let buf = "";
+      child.stderr?.on("data", (d) => {
+        buf += d.toString();
+        const m = /(\d+(?:\.\d+)?)%/.exec(buf);
+        if (m) {
+          job.progress = Math.min(88, Math.round(parseFloat(m[1]) * 0.88));
+          buf = buf.slice(-40);
+        }
+      });
+      child.on("error", () => resolve(false));
+      child.on("close", (code) => {
+        if ((job.status as string) === "canceled") return resolve(false);
+        let size = 0;
+        try {
+          size = statSync(dest).size;
+        } catch {
+          /* no file */
+        }
+        resolve(code === 0 && size > 0);
+      });
+    });
+    if (ok) return true;
+    job.log.push("[fclip] curl tunnel download failed — trying native fetch…");
+  }
   try {
     const res = await fetch(url, {
       signal: AbortSignal.timeout(15 * 60_000),
       headers: { "user-agent": "Mozilla/5.0 (X11; Linux x86_64) fclip/1.0" },
       redirect: "follow",
     });
-    if (!res.ok || !res.body) return false;
+    if (!res.ok || !res.body) {
+      job.log.push(`[fclip] tunnel responded HTTP ${res.status}`);
+      return false;
+    }
     const total = Number(res.headers.get("content-length") ?? "0");
     let got = 0;
     const counter = new TransformStream<Uint8Array, Uint8Array>({

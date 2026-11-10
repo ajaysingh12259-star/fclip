@@ -183,25 +183,27 @@ export interface CobaltMedia {
 }
 
 /**
- * Ask a Cobalt relay instance to resolve the video. Cobalt answers with a
- * TUNNEL URL that serves the media bytes through the instance's own server —
- * any IP can download them (measured live: 200 + valid mp4 through
- * co.otomir23.me while every Piped byte-proxy 403'd). This is the byte
- * backbone of the cookie-less tier.
+ * Ask every Cobalt relay for a tunnel URL. Cobalt serves the media bytes
+ * through its own server — any IP can download them. NOTE: cobalt instances
+ * suffer per-video YouTube walls too (a tunnel may answer 200 with 0 bytes),
+ * so callers must verify actual bytes and try every candidate.
  */
-export async function fetchCobaltTunnel(pageUrl: string, maxHeight: number | null): Promise<CobaltMedia | null> {
+export async function fetchCobaltTunnels(pageUrl: string, maxHeight: number | null): Promise<CobaltMedia[]> {
   const quality = maxHeight && maxHeight > 0 ? String(Math.min(Math.round(maxHeight), 1080)) : "1080";
   const body = JSON.stringify({ url: pageUrl, videoQuality: quality, downloadMode: "auto" });
-  for (const h of COBALT_HOSTS) {
-    const j = await fetchJsonPost(`https://${h}/`, body, 15_000);
-    const obj = j as { status?: string; url?: string } | null;
-    if (obj && (obj.status === "tunnel" || obj.status === "redirect") && typeof obj.url === "string" && obj.url) {
-      console.log(`[fclip-relay] cobalt ${h} → tunnel for ${pageUrl.slice(-20)}`);
-      return { url: obj.url, host: h };
-    }
-  }
-  console.log("[fclip-relay] no cobalt host produced a tunnel");
-  return null;
+  const results = await Promise.all(
+    COBALT_HOSTS.map(async (h): Promise<CobaltMedia | null> => {
+      const j = await fetchJsonPost(`https://${h}/`, body, 15_000);
+      const obj = j as { status?: string; url?: string } | null;
+      if (obj && (obj.status === "tunnel" || obj.status === "redirect") && typeof obj.url === "string" && obj.url) {
+        return { url: obj.url, host: h };
+      }
+      return null;
+    })
+  );
+  const list = results.filter((x): x is CobaltMedia => x !== null);
+  console.log(`[fclip-relay] cobalt tunnels: ${list.length}/${COBALT_HOSTS.length} hosts`);
+  return list;
 }
 
 function isProxiedUrl(u: string): boolean {
