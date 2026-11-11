@@ -338,8 +338,10 @@ async function runFarmLadder(job: ClipJob, params: CreateJobParams, dir: string)
   const want4k = params.maxHeight != null && params.maxHeight >= 1440;
   const clipLen = params.end - params.start;
 
-  /* ---- savenow farm: whole-source render in any format + stream-trim ---- */
-  const tryFarmSource = async (fmt: "4k" | "1080"): Promise<boolean> => {
+  /* ---- savenow farm: whole-source render in any format + stream-trim ----
+   * "mislabeled" = trim succeeded but the file is smaller than the format
+   * asked for (the farm's host pool is inconsistent — measured live). */
+  const tryFarmSource = async (fmt: "4k" | "1080"): Promise<"ok" | "mislabeled" | "failed"> => {
     try {
       job.status = "running";
       job.stage = fmt === "4k" ? "Farm: rendering full source (4K)" : "Farm: rendering full source (1080p)";
@@ -356,22 +358,44 @@ async function runFarmLadder(job: ClipJob, params: CreateJobParams, dir: string)
           if (text) job.stage = `Farm: rendering ${fmt === "4k" ? "4K" : "1080p"} (${text.slice(0, 40)})`;
         },
       });
-      if ((job.status as string) === "canceled") return false;
+      if ((job.status as string) === "canceled") return "failed";
       job.log.push(`[fclip] farm returned ${render.fullFormat} — stream-trimming the range (no temp file)…`);
       job.stage = "Farm: stream-trimming the range";
       job.progress = 62;
       const ok = await streamTrimFromUrl(job, render.url, params.start, dur, dir);
       if (!ok) {
         job.log.push("[fclip] farm stream-trim failed — trying next lane…");
-        return false;
+        return "failed";
+      }
+      // The farm's rotating hosts are NOT consistent: the same "4k" render
+      // sometimes delivers an h264 1080p file (measured live). A 4K pick
+      // only accepts a real ≥1440p file — otherwise drop it and let the
+      // ladder deliver an honestly-labeled 1080p60 instead.
+      if (fmt === "4k") {
+        const clips = readdirSync(dir).filter((f) => f.startsWith("clip.") && !f.endsWith(".part"));
+        const clipPath = clips.length > 0 ? path.join(dir, clips[0]) : null;
+        const height = clipPath ? await probeMediaHeight(clipPath) : null;
+        if (height !== null && height < 1440) {
+          job.log.push(
+            `[fclip] farm served a ${height}p file labeled 2160p — discarding it, degrading honestly…`
+          );
+          for (const f of clips) {
+            try {
+              rmSync(path.join(dir, f), { force: true });
+            } catch {
+              /* best effort */
+            }
+          }
+          return "mislabeled";
+        }
       }
       job.stage = "Finalizing";
       job.progress = 100;
-      return true;
+      return "ok";
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       job.log.push(`[fclip] ${fmt === "4k" ? "4K" : "1080p"} farm unavailable: ${msg.slice(0, 140)}`);
-      return false;
+      return "failed";
     }
   };
 
@@ -405,7 +429,13 @@ async function runFarmLadder(job: ClipJob, params: CreateJobParams, dir: string)
   };
 
   if (want4k) {
-    if (await tryFarmSource("4k")) {
+    let r = await tryFarmSource("4k");
+    if (r === "mislabeled") {
+      // Fresh request → fresh host roll; one retry is worth it for 4K.
+      job.log.push("[fclip] retrying the 4K farm once (host pool is inconsistent)…");
+      r = await tryFarmSource("4k");
+    }
+    if (r === "ok") {
       await finalizeJob(job, dir);
       return;
     }
@@ -414,7 +444,7 @@ async function runFarmLadder(job: ClipJob, params: CreateJobParams, dir: string)
       await finalizeJob(job, dir);
       return;
     }
-    if (await tryFarmSource("1080")) {
+    if ((await tryFarmSource("1080")) === "ok") {
       await finalizeJob(job, dir);
       return;
     }
@@ -427,7 +457,7 @@ async function runFarmLadder(job: ClipJob, params: CreateJobParams, dir: string)
     // HD farm refused (credits gate, walled range…) — the savenow farm
     // renders the source in 1080p and we stream-trim the range. No disk
     // needed, so ranges anywhere in the source work.
-    if (await tryFarmSource("1080")) {
+    if ((await tryFarmSource("1080")) === "ok") {
       await finalizeJob(job, dir);
       return;
     }
@@ -730,6 +760,21 @@ async function probeMediaDuration(source: string): Promise<number | null> {
     const probe = JSON.parse(stdout) as { format?: { duration?: string } };
     const d = parseFloat(probe?.format?.duration ?? "0");
     return Number.isFinite(d) && d > 0 ? d : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Video height of the first stream (ffprobe; null when unreadable). */
+async function probeMediaHeight(source: string): Promise<number | null> {
+  try {
+    const { stdout } = await execFileAsync(
+      FFPROBE,
+      ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=height", "-of", "csv=p=0", source],
+      { timeout: 30_000 }
+    );
+    const h = Number.parseInt(stdout.trim(), 10);
+    return Number.isFinite(h) && h > 0 ? h : null;
   } catch {
     return null;
   }
