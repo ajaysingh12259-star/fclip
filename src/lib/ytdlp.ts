@@ -1679,17 +1679,26 @@ async function downloadTunnelFile(
 
 /** Stream-copy the selected range out of a local file (fast, lossless). */
 async function ffmpegLocalCut(job: ClipJob, src: string, start: number, dur: number, dir: string): Promise<void> {
-  // Container must follow the codecs: tunnel relays can hand us 4K VP9/Opus
-  // (even with an .mp4 filename) — that belongs in a webm, not mp4.
+  // Container must follow BOTH codecs: tunnel relays hand us VP9/Opus (webm),
+  // but the savenow 4K render farm hands us AV1 + AAC — AAC is NOT valid in
+  // WebM ("Only VP8/VP9/AV1 video and Vorbis/Opus audio… supported"), so an
+  // AV1+AAC source must stay mp4. Measured live: picking webm off the video
+  // codec alone made ffmpeg die with "Could not write header".
   let ext = "mp4";
   try {
     const { stdout } = await execFileAsync(
       FFPROBE,
-      ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", src],
+      ["-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0", src],
       { timeout: 15_000 }
     );
-    const v = stdout.trim().split("\n")[0] ?? "";
-    if (/^(vp9|vp8|av1)$/i.test(v)) ext = "webm";
+    const codecs = stdout
+      .trim()
+      .split("\n")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+    const v = codecs.find((c) => /^(h264|hevc|vp8|vp9|av1|mpeg4)$/.test(c)) ?? "";
+    const a = codecs.find((c) => /^(aac|opus|vorbis|mp3|flac)$/.test(c)) ?? "";
+    if (/^(vp8|vp9|av1)$/.test(v) && (a === "" || /^(opus|vorbis)$/.test(a))) ext = "webm";
   } catch {
     /* probe failed — default to mp4 */
   }
