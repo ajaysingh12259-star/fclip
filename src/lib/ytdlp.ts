@@ -1864,10 +1864,18 @@ export function cleanupOldJobs() {
     }
   }
   // Disk guard: cap finished clips at ~1.5 GB total AND keep real free
-  // space on the filesystem ≥ 450 MB. The size cap alone never fires on
-  // small volumes (measured: Railway volume sat at 70 MB free with the
-  // 1.5 GB guard still satisfied) — free-space pruning is what actually
-  // rescues the 4K render prefix downloads.
+  // space on the filesystem. The size cap alone never fires on small
+  // volumes (measured: Railway volume sat at 70 MB free with the 1.5 GB
+  // guard still satisfied) — free-space pruning is what actually rescues
+  // the 4K render prefix downloads. Two hard lessons from live traffic:
+  //  1. NEVER remove queued/running jobs — their dir holds the clip being
+  //     written right now, and removeJob() on a queued job loses user work
+  //     instantly (measured: every job vanished within 1 s when the guard
+  //     treated "queued" as prunable).
+  //  2. The free target must be PROPORTIONAL to the volume — a fixed 450 MB
+  //     demand on a ~1 GB volume is unreachable and turns the guard into a
+  //     job-shredder that runs on every creation. target = max(300 MB, 8%
+  //     of volume), capped at 450 MB — enough headroom for the 4K prefix.
   try {
     const freeNow = (): number => {
       try {
@@ -1877,6 +1885,14 @@ export function cleanupOldJobs() {
         return Infinity;
       }
     };
+    let target = 450e6;
+    try {
+      const s = statfsSync(CLIPS_DIR);
+      const volume = Number(s.blocks) * Number(s.bsize);
+      target = Math.min(450e6, Math.max(300e6, volume * 0.08));
+    } catch {
+      /* keep the default target */
+    }
     let total = 0;
     const entries: { id: string; size: number; mtime: number }[] = [];
     for (const dir of readdirSync(CLIPS_DIR)) {
@@ -1894,11 +1910,15 @@ export function cleanupOldJobs() {
     }
     entries.sort((a, b) => a.mtime - b.mtime);
     let free = freeNow();
-    while ((total > 1.5e9 || free < 450e6) && entries.length > 0) {
+    let guard = 200; // absolute bound on pruning iterations
+    while ((total > 1.5e9 || free < target) && entries.length > 0 && guard-- > 0) {
       const oldest = entries.shift() as { id: string; size: number };
       const job = jobs.get(oldest.id);
-      if (job && job.status !== "running") removeJob(oldest.id);
-      else if (!job) {
+      if (job && (job.status === "running" || job.status === "queued")) {
+        continue; // live work — never touch, never count as freed
+      }
+      if (job) removeJob(oldest.id);
+      else {
         try {
           rmSync(path.join(CLIPS_DIR, oldest.id), { recursive: true, force: true });
         } catch {
