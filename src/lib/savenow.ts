@@ -65,10 +65,13 @@ const ORIGIN = "https://en.loader.to";
  * en.loader.to, loader.to, convertr.org — drain the same pool, referer
  * rotation does NOT open new pools, PoW tokens and XFF spoofing don't help).
  * An owned key skips the global pool entirely and is the only guaranteed
- * 4K path when the shared pool is dry.
+ * 4K path when the shared pool is dry. With an owned key the PoW dance is
+ * skipped and a quota throttle fails through FAST (the ladder degrades to
+ * the 1080p60 farm instead of burning minutes on backoff loops).
  */
 const SHARED_FRONTEND_API_KEY =
-  process.env.FCLIP_SAVENOW_API_KEY || "dfcb6d76f2f6a9894gjkege8a4ab232222";
+  process.env.FCLIP_SAVENOW_API_KEY?.trim() || "dfcb6d76f2f6a9894gjkege8a4ab232222";
+const HAS_OWN_KEY = Boolean(process.env.FCLIP_SAVENOW_API_KEY?.trim());
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
@@ -190,8 +193,10 @@ async function ensurePowToken(): Promise<string | null> {
 /**
  * Request a full-video render in the given format ("4k" is the measured-good
  * value; "1440" exists in their dropdown but is unconfirmed server-side).
- * Retries up to 3 attempts through throttle windows (90 s+ backoff) because
- * bursts trip the misleading "api_key_required" budget even with the correct key.
+ * Shared-key mode: retries 3 attempts through throttle windows (90 s+
+ * backoff). Owned-key mode (FCLIP_SAVENOW_API_KEY): no PoW dance, and a
+ * quota throttle fails through immediately — burning a registered key's
+ * request budget on hopeless retries is worse than degrading to 1080p60.
  */
 export async function savenowRequestRender(
   videoId: string,
@@ -201,14 +206,11 @@ export async function savenowRequestRender(
   const pageUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const qs = `format=${encodeURIComponent(format)}&url=${encodeURIComponent(pageUrl)}&apikey=${SHARED_FRONTEND_API_KEY}`;
   let lastErr = "";
+  let failThrough = false;
 
-  // The shared key's global quota pool frees slots opportunistically (two
-  // full renders landed amid global traffic). 90 s+ backoff × 3 attempts
-  // catches short droughts; a hard-empty pool fails through in ~4 min and
-  // the ladder falls back to 1080p60 → 360p.
-  for (let attempt = 0; attempt < (opts.throttleRetry === false ? 1 : 3); attempt++) {
-    if (attempt > 0) await sleep(90_000 + Math.floor(Math.random() * 20_000));
-    const bearer = await ensurePowToken(); // fail-open; mirrors the browser
+  outer: for (let attempt = 0; attempt < (HAS_OWN_KEY ? 2 : opts.throttleRetry === false ? 1 : 3); attempt++) {
+    if (attempt > 0) await sleep(HAS_OWN_KEY ? 4_000 : 90_000 + Math.floor(Math.random() * 20_000));
+    const bearer = HAS_OWN_KEY ? null : await ensurePowToken(); // fail-open; mirrors the browser
     for (const base of [SAVE_BASE, SAVE_BASE_FALLBACK]) {
       try {
         const res = await curlGet(`${base}/api/v2/download?${qs}`, 25, bearer);
@@ -227,6 +229,12 @@ export async function savenowRequestRender(
         }
         if (isThrottle(body)) {
           lastErr = "throttled (api_key_required)";
+          if (HAS_OWN_KEY) {
+            // owned key: fail through to the 1080p60 lane NOW — no fallback
+            // host, no retry window (each request burns key budget)
+            failThrough = true;
+            break outer;
+          }
           break; // don't hammer the fallback host too — wait instead
         }
         lastErr = String(body.error_code ?? body.message ?? `HTTP ${res.status}`);
@@ -249,7 +257,7 @@ export async function savenowPoll(
   const timeoutMs = opts.timeoutMs ?? 10 * 60_000;
   const deadline = Date.now() + timeoutMs;
   let lastText = "";
-  const bearer = await ensurePowToken();
+  const bearer = HAS_OWN_KEY ? null : await ensurePowToken();
 
   while (Date.now() < deadline) {
     let url: string | undefined;

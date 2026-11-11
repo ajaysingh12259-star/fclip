@@ -1,67 +1,52 @@
 import { NextResponse } from "next/server";
-import { readFileSync, existsSync, statSync } from "fs";
-import { checkEngine, getBinaryPaths, getCookiesMode, cookieHealth, stormStatus, warpHealth, COOKIES_PATH } from "@/lib/ytdlp";
-import { relayHealth } from "@/lib/instances";
+import { execFile } from "child_process";
+import { promisify } from "util";
+import { checkEngine, getBinaryPaths, farmStatus, DATA_DIR } from "@/lib/ytdlp";
+
+const execFileAsync = promisify(execFile);
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /**
- * Safe diagnostics: reports cookie *domains* (never values), provider
- * reachability and engine status. Helps troubleshoot bot-wall issues
- * (e.g. detecting that a non-YouTube cookies.txt was pasted by mistake).
+ * Safe diagnostics for the render-farm engine: binary status, farm key
+ * presence (never the key value) and live reachability of both farm lanes.
  */
 export async function GET() {
   const engine = await checkEngine();
 
-  let provider: { reachable: boolean; version?: string } = { reachable: false };
-  try {
-    const res = await fetch("http://127.0.0.1:4416/ping", { signal: AbortSignal.timeout(5000) });
-    if (res.ok) {
-      const body = (await res.json()) as { version?: string };
-      provider = { reachable: true, version: body.version };
-    }
-  } catch {
-    /* provider not running */
-  }
-
-  let cookies: Record<string, unknown> = { present: false };
-  if (existsSync(COOKIES_PATH)) {
+  /** HEAD-like reachability probe through curl (both farms sit behind
+   *  Cloudflare TLS fingerprinting — curl passes where fetch 403s). */
+  const probe = async (url: string, extra: string[] = []): Promise<number | null> => {
     try {
-      const lines = readFileSync(COOKIES_PATH, "utf8").split("\n");
-      const domainCounts = new Map<string, number>();
-      let cookieLines = 0;
-      for (const line of lines) {
-        if (!line.trim() || line.startsWith("#")) continue;
-        cookieLines++;
-        const domain = line.split("\t")[0]?.trim() ?? "?";
-        domainCounts.set(domain, (domainCounts.get(domain) ?? 0) + 1);
-      }
-      const domains = [...domainCounts.entries()]
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 6)
-        .map(([domain, count]) => ({ domain, count }));
-      cookies = {
-        present: true,
-        savedAt: statSync(COOKIES_PATH).mtime.toISOString(),
-        cookieLines,
-        domains,
-      };
+      const { stdout } = await execFileAsync(
+        "curl",
+        ["-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "8", ...extra, url],
+        { timeout: 12_000, encoding: "utf8" }
+      );
+      const code = Number.parseInt(stdout.trim(), 10);
+      return Number.isFinite(code) ? code : null;
     } catch {
-      cookies = { present: true, error: "unreadable" };
+      return null;
     }
-  }
+  };
+
+  const [savenow, videolimit] = await Promise.all([
+    probe("https://p.savenow.to/api/pow/challenge"),
+    probe("https://videolimit.com/api/videolimit/clip-token"),
+  ]);
 
   return NextResponse.json({
     service: "fclip",
     engine,
-    provider,
-    cookies,
-    cookieHealth: cookieHealth(),
-    storm: stormStatus(),
-    warp: await warpHealth(),
-    relay: relayHealth(),
-    cookiesMode: getCookiesMode(),
     binaries: getBinaryPaths(),
+    farm: farmStatus(),
+    lanes: {
+      savenowReachable: savenow !== null && savenow < 500,
+      savenowHttp: savenow,
+      videolimitReachable: videolimit !== null && videolimit < 500,
+      videolimitHttp: videolimit,
+    },
+    clipsDir: DATA_DIR,
   });
 }

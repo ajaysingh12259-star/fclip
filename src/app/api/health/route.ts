@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { checkEngine, getCookiesMode, isVercel, DATA_DIR } from "@/lib/ytdlp";
+import { checkEngine, farmStatus, isVercel, DATA_DIR } from "@/lib/ytdlp";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -11,7 +11,7 @@ export async function GET() {
     ok: true,
     service: "fclip",
     engine,
-    cookies: getCookiesMode(),
+    farm: farmStatus(),
     dataDir: DATA_DIR,
     vercel: isVercel(),
   });

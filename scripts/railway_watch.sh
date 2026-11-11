@@ -1,6 +1,6 @@
 #!/bin/bash
 # Poll Railway fclip service until the build finishes, then hit /api/health
-export RAILWAY_TOKEN=rlwy_proj_MgsdSUk1oBMBIvDlUTmJb38wuW8b190ug80U4THs
+export RAILWAY_TOKEN="${RAILWAY_TOKEN:?export RAILWAY_TOKEN first}"
 
 for i in $(seq 1 18); do
   STATUS=$(railway status 2>/dev/null | grep -E "^\s+- fclip:" | head -1)

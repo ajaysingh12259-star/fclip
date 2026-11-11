@@ -3,16 +3,17 @@
 import { useCallback, useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Loader2, RefreshCw, Activity, ShieldCheck, ShieldAlert, KeyRound, Radio, CloudCog, Swords } from "lucide-react";
+import { Loader2, RefreshCw, Activity, ShieldCheck, ShieldAlert, KeyRound, CloudCog, Radio } from "lucide-react";
 
 interface Diag {
-  engine?: { ytDlp: boolean; ffmpeg: boolean; ffprobe: boolean };
-  provider?: { reachable: boolean; version?: string };
-  cookieHealth?: { present: boolean; loggedIn: boolean; names: string[]; lineCount: number };
-  storm?: { winner: string | null; at: number | null };
-  warp?: { socks5: boolean };
-  relay?: { ok: string[]; checkedAt: number | null; known: number };
-  cookiesMode?: string;
+  engine?: { ffmpeg: boolean; ffprobe: boolean; farmKey: boolean };
+  farm?: { hdLane: string; fourKLane: string; fourKKeyConfigured: boolean };
+  lanes?: {
+    savenowReachable: boolean;
+    savenowHttp: number | null;
+    videolimitReachable: boolean;
+    videolimitHttp: number | null;
+  };
 }
 
 function Row({
@@ -82,39 +83,31 @@ export function DiagPanel({ open }: { open: boolean }) {
           {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden /> : <RefreshCw className="h-3.5 w-3.5" aria-hidden />}
         </Button>
       </div>
-      <Row icon={CloudCog} label="yt-dlp / ffmpeg / ffprobe" ok={Boolean(diag?.engine?.ytDlp && diag?.engine?.ffmpeg && diag?.engine?.ffprobe)} detail="binaries" />
-      <Row icon={Radio} label="PO-token provider (BotGuard)" ok={Boolean(diag?.provider?.reachable)} detail={diag?.provider?.version ? `v${diag.provider.version}` : "bgutil"} />
-      <Row
-        icon={Swords}
-        label="Client storm"
-        ok={Boolean(diag?.storm?.winner)}
-        detail={diag?.storm?.winner ? `winner: ${diag.storm.winner}` : "no breakthrough yet"}
-        detailTone={diag?.storm?.winner ? "neutral" : "warn"}
-      />
-      <Row icon={CloudCog} label="WARP egress (Cloudflare)" ok={Boolean(diag?.warp?.socks5)} detail="socks5 sidecar" detailTone="warn" />
-      <Row
-        icon={Radio}
-        label="Relay network (Piped/Invidious)"
-        ok={(diag?.relay?.ok?.length ?? 0) > 0}
-        detail={diag?.relay ? `${diag.relay.ok.length}/${diag.relay.known} hosts alive` : "not probed yet"}
-        detailTone={(diag?.relay?.ok?.length ?? 0) > 0 ? "neutral" : "warn"}
-      />
+      <Row icon={CloudCog} label="ffmpeg / ffprobe" ok={Boolean(diag?.engine?.ffmpeg && diag?.engine?.ffprobe)} detail="cutting binaries" />
       <Row
         icon={KeyRound}
-        label="Cookies"
-        ok={Boolean(diag?.cookieHealth?.loggedIn)}
-        detail={
-          diag?.cookieHealth?.present
-            ? diag.cookieHealth.loggedIn
-              ? `${diag.cookieHealth.lineCount} lines · logged in`
-              : "present but signed out"
-            : "none uploaded"
-        }
-        detailTone={diag?.cookieHealth?.loggedIn ? "neutral" : "warn"}
+        label="4K farm API key"
+        ok={Boolean(diag?.engine?.farmKey)}
+        detail={diag?.engine?.farmKey ? "registered key active" : "shared fallback key"}
+        detailTone={diag?.engine?.farmKey ? "neutral" : "warn"}
+      />
+      <Row
+        icon={Radio}
+        label="HD render lane (1080p60)"
+        ok={Boolean(diag?.lanes?.videolimitReachable)}
+        detail={diag?.lanes?.videolimitHttp != null ? `HTTP ${diag.lanes.videolimitHttp}` : "unreachable"}
+        detailTone={diag?.lanes?.videolimitReachable ? "neutral" : "warn"}
+      />
+      <Row
+        icon={Radio}
+        label="4K render farm (2160p)"
+        ok={Boolean(diag?.lanes?.savenowReachable)}
+        detail={diag?.lanes?.savenowHttp != null ? `HTTP ${diag.lanes.savenowHttp}` : "unreachable"}
+        detailTone={diag?.lanes?.savenowReachable ? "neutral" : "warn"}
       />
       <p className="pt-1 text-[11px] leading-relaxed text-muted-foreground">
-        Cutting works best when at least one of: cookies, a storm winner, or the relay network is green — they are
-        tried in that order and the relay tier never needs cookies.
+        Ladder: 1080p picks render true 1080p60 on the first try; 2K/4K picks ride the 4K farm and degrade to
+        1080p60 only if it refuses. No cookies involved anywhere.
       </p>
     </div>
   );

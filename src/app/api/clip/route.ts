@@ -36,9 +36,9 @@ export async function POST(req: Request) {
     if (end - start > 3600) {
       return NextResponse.json({ error: "Clip is longer than 1 hour — please pick a shorter range." }, { status: 400 });
     }
-    // Fail fast (and clearly) on hosts that cannot run yt-dlp/ffmpeg, e.g. Vercel.
+    // Fail fast (and clearly) on hosts that cannot run ffmpeg, e.g. Vercel.
     const engine = await checkEngine();
-    if (!engine.ytDlp || !engine.ffmpeg) {
+    if (!engine.ffmpeg) {
       return NextResponse.json({ error: engineMissingMessage() }, { status: 500 });
     }
     const job = createClipJob({

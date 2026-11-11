@@ -26,14 +26,12 @@ import {
 import { useToast } from "@/hooks/use-toast";
 import { Timeline } from "@/components/fclip/timeline";
 import { YtPlayer, type YtPlayerHandle } from "@/components/fclip/yt-player";
-import { CookiesDialog } from "@/components/fclip/cookies-dialog";
 import { DiagPanel } from "@/components/fclip/diag-panel";
 import {
   Scissors,
   Link2,
   Download,
   Loader2,
-  KeyRound,
   Clapperboard,
   Timer,
   Eye,
@@ -74,7 +72,7 @@ interface VideoInfo {
   chapters: { start: number; end: number; title: string }[] | null;
   qualities: { height: number; tbr: number | null; ext: string }[];
   qualityHint?: string | null;
-  route?: "direct" | "storm" | "relay";
+  route?: "farm";
   webpageUrl: string;
 }
 
@@ -228,8 +226,6 @@ export default function Home() {
   const [recent, setRecent] = useState<JobView[]>([]);
   const [startingClip, setStartingClip] = useState(false);
 
-  const [cookiesOpen, setCookiesOpen] = useState(false);
-  const [cookiesPresent, setCookiesPresent] = useState(false);
   const [diagOpen, setDiagOpen] = useState(false);
   const [engineUp, setEngineUp] = useState<boolean | null>(null);
 
@@ -254,9 +250,6 @@ export default function Home() {
 
   useEffect(() => {
     void refreshRecent();
-    void jsonFetch<{ present: boolean }>("/api/cookies").then(({ ok, data }) => {
-      if (ok) setCookiesPresent(data.present);
-    });
     void jsonFetch<{ ok: boolean }>("/api/health").then(({ ok, data }) => {
       setEngineUp(ok && data.ok !== false);
     });
@@ -282,7 +275,7 @@ export default function Home() {
           setInfoError(data.error ?? { code: "unknown", message: "Could not fetch video info." });
           // The bot wall only blocks the server — the YouTube player still works
           // in the browser, so fall back to it for the preview + times.
-          if (data.error?.code === "bot_check" && parseVideoId(target)) {
+          if (data.error?.code === "unavailable" && parseVideoId(target)) {
             setFallbackPending(true);
           }
           return;
@@ -297,7 +290,7 @@ export default function Home() {
         setEnd(Math.round(Math.max(s + 1, e) * 10) / 10);
         setQuality("best");
         if (v.qualityHint) {
-          toast({ title: "Fetched via the cookie-free relay", description: v.qualityHint });
+          toast({ title: "Render-farm engine active", description: v.qualityHint });
         }
       } catch {
         setInfoError({
@@ -396,6 +389,25 @@ export default function Home() {
     return () => clearInterval(iv);
   }, [fallbackPending, ytId, url, toast]);
 
+  /* ------- patch duration from the in-browser player when the server
+     couldn't get it (YouTube walls datacenter IPs, never your browser) ------- */
+
+  useEffect(() => {
+    if (!info || info.duration > 0 || !ytId) return;
+    const startedAt = Date.now();
+    const iv = setInterval(() => {
+      const d = playerRef.current?.getDuration() ?? 0;
+      if (d > 0) {
+        clearInterval(iv);
+        setInfo((prev) => (prev && prev.duration === 0 ? { ...prev, duration: d } : prev));
+        setEnd((e) => (e <= 1 ? Math.min(30, d) : e));
+      } else if (Date.now() - startedAt > 20000) {
+        clearInterval(iv);
+      }
+    }, 400);
+    return () => clearInterval(iv);
+  }, [info, ytId]);
+
   /* ------- preview the selected range inside the player ------- */
 
   useEffect(() => {
@@ -471,7 +483,7 @@ export default function Home() {
       applyRange(start, end);
       return;
     }
-    const max = info?.duration ?? 36000;
+    const max = info?.duration ? info.duration : 36000;
     if (which === "start") {
       const s = Math.min(parsed, Math.max(0, end - 1), Math.max(0, max - 1));
       applyRange(Math.round(s * 10) / 10, end);
@@ -616,10 +628,6 @@ export default function Home() {
               <Activity className="h-4 w-4" aria-hidden />
               <span className="hidden sm:inline">Diagnostics</span>
             </Button>
-            <Button variant="ghost" size="sm" onClick={() => setCookiesOpen(true)} aria-label="Cookie settings" className="gap-2">
-              <KeyRound className="h-4 w-4" aria-hidden />
-              <span className="hidden sm:inline">Cookies{cookiesPresent ? " ✓" : ""}</span>
-            </Button>
           </div>
         </div>
       </header>
@@ -631,19 +639,19 @@ export default function Home() {
           <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.4 }}>
             <Badge variant="outline" className="mb-4 gap-1.5 border-white/10 bg-white/5 px-3 py-1 text-xs text-muted-foreground">
               <Zap className="h-3 w-3 text-fuchsia-400" aria-hidden />
-              yt-dlp + ffmpeg · byte-range cutting · up to 4K
+              render-farm engine · 1080p60 first try · TRUE 4K
             </Badge>
             <h1 className="text-balance text-4xl font-extrabold tracking-tight sm:text-5xl">
               Cut YouTube clips,{" "}
               <span className="bg-gradient-to-r from-violet-400 via-fuchsia-400 to-orange-300 bg-clip-text text-transparent">
-                no cookies needed
+                rendered on the farm
               </span>
             </h1>
             <p className="mx-auto mt-4 max-w-2xl text-pretty text-sm leading-relaxed text-muted-foreground sm:text-base">
-              Paste a link, pick the exact seconds, download just that part. fclip streams
-              <strong className="text-foreground"> only the byte-ranges it needs</strong> and, when YouTube walls the
-              server, switches to its <strong className="text-foreground">turbo relay backbone</strong> — an account
-              and cookies are never required.
+              Paste a link, pick the exact seconds, download just that part. fclip sends your range to
+              <strong className="text-foreground"> premium render farms</strong> — a true 1080p60 cut on the first
+              try, and <strong className="text-foreground">real 3840×2160 4K</strong> for 4K picks. No cookies, no
+              bot walls, no accounts.
             </p>
           </motion.div>
 
@@ -730,11 +738,9 @@ export default function Home() {
             <Alert className="border-amber-500/40 bg-amber-500/[0.07]">
               <TriangleAlert className="h-4 w-4 text-amber-400" aria-hidden />
               <AlertTitle>
-                {infoError.code === "bot_check" || infoError.code === "no_formats"
-                  ? "YouTube wants to verify this server"
-                  : infoError.code === "engine_missing"
-                    ? "This server can't run fclip"
-                    : "Could not fetch this video"}
+                {infoError.code === "engine_missing"
+                  ? "This server can't run fclip"
+                  : "Could not fetch this video"}
               </AlertTitle>
               <AlertDescription className="mt-1.5 space-y-3 text-sm">
                 <p>{infoError.message}</p>
@@ -751,23 +757,19 @@ export default function Home() {
                     </a>
                   </div>
                 )}
-                {(infoError.code === "bot_check" || infoError.code === "no_formats") && (
+                {(infoError.code === "unavailable" || infoError.code === "unsupported") && (
                   <div className="flex flex-wrap gap-2">
-                    <Button size="sm" onClick={() => setCookiesOpen(true)} className="gap-2 bg-gradient-to-r from-violet-500 to-fuchsia-500 text-white hover:opacity-90">
-                      <KeyRound className="h-4 w-4" aria-hidden /> Add browser cookies
-                    </Button>
                     <Button size="sm" variant="outline" onClick={enterManualMode} className="gap-2 border-white/10 bg-white/5 hover:bg-white/10">
                       <PencilLine className="h-4 w-4" aria-hidden /> Enter times manually
                     </Button>
-                    <span className="py-1.5 text-xs text-muted-foreground">or try again — the relay network may pick it up.</span>
                   </div>
                 )}
               </AlertDescription>
             </Alert>
 
             {/* The preview still streams from YouTube inside the browser even when the
-                server is bot-walled — attach the player so the crop tools can use it. */}
-            {(infoError.code === "bot_check" || infoError.code === "no_formats") && ytId && (
+                server could not fetch info — attach the player so the crop tools can use it. */}
+            {(infoError.code === "unavailable" || infoError.code === "unsupported") && ytId && (
               <div className="mt-4 space-y-2">
                 <YtPlayer ref={playerRef} videoId={ytId} />
                 {fallbackPending && (
@@ -833,28 +835,12 @@ export default function Home() {
                     <div className="min-w-0">
                       <h2 className="line-clamp-2 text-base font-semibold leading-snug sm:text-lg">{info.title}</h2>
                       <div className="mt-1.5 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                        {info.route === "relay" && (
+                        {info.route === "farm" && (
                           <span
                             className="inline-flex items-center gap-1 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-300"
-                            title="Served through fclip's cookie-less turbo relay — residential-egress extraction, byte proxy, no bot wall"
+                            title="Rendered by fclip's premium render farms — 1080p60 first try, TRUE 4K via the 4K farm, no cookies"
                           >
-                            <Zap className="h-3 w-3" aria-hidden /> Turbo route
-                          </span>
-                        )}
-                        {info.route === "storm" && (
-                          <span
-                            className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-300"
-                            title="YouTube was bypassed via a parallel player-identity burst — no cookies used"
-                          >
-                            <Zap className="h-3 w-3" aria-hidden /> Storm breakthrough
-                          </span>
-                        )}
-                        {(!info.route || info.route === "direct") && (
-                          <span
-                            className="inline-flex items-center gap-1 rounded-full border border-emerald-500/40 bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-300"
-                            title="Fetched directly by the server — fastest path"
-                          >
-                            <ShieldCheck className="h-3 w-3" aria-hidden /> Direct
+                            <Zap className="h-3 w-3" aria-hidden /> Render farm
                           </span>
                         )}
                         {info.channel && (
@@ -904,8 +890,7 @@ export default function Home() {
                     <Alert className="mt-3 border-amber-500/40 bg-amber-500/[0.07]">
                       <TriangleAlert className="h-4 w-4 text-amber-400" aria-hidden />
                       <AlertDescription className="text-xs leading-relaxed">
-                        Preview &amp; times come straight from your browser. Cutting will auto-retry through
-                        alternate clients and the cookie-free relay network.
+                        Preview &amp; times come straight from your browser. The render farm will cut the range server-side.
                       </AlertDescription>
                     </Alert>
                   )}
@@ -922,7 +907,7 @@ export default function Home() {
                   {info.qualityHint && (
                     <p
                       className={`mt-3 rounded-lg border px-3 py-2 text-xs leading-relaxed ${
-                        info.route === "relay"
+                        info.route === "farm"
                           ? "border-emerald-500/30 bg-emerald-500/[0.08] text-emerald-300"
                           : "border-fuchsia-500/30 bg-fuchsia-500/[0.08] text-fuchsia-300"
                       }`}
@@ -1048,7 +1033,7 @@ export default function Home() {
                     )}
                     {isWebmPick && (
                       <p className="text-xs text-amber-400">
-                        2K/4K on YouTube use VP9 (webm) — plays in browsers &amp; VLC. Pick 1080p for classic MP4 (H.264).
+                        4K renders come back as 3840×2160 AV1 in mp4 — plays in browsers &amp; VLC. Pick 1080p for classic H.264.
                       </p>
                     )}
                   </div>
@@ -1089,14 +1074,12 @@ export default function Home() {
               <Card className="hidden border-white/10 bg-white/[0.03] lg:block">
                 <CardContent className="p-4">
                   <p className="mb-2 flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                    <ListVideo className="h-3.5 w-3.5" aria-hidden /> How the pipeline picks a route
+                    <ListVideo className="h-3.5 w-3.5" aria-hidden /> How the farm pipeline works
                   </p>
                   <ol className="space-y-1.5 text-xs leading-relaxed text-muted-foreground">
-                    <li><strong className="text-foreground">1 · Direct</strong> — yt-dlp with BotGuard PO tokens, no cookies.</li>
-                    <li><strong className="text-foreground">2 · Storm</strong> — parallel player-identity bursts until one gets through.</li>
-                    <li><strong className="text-foreground">3 · Turbo relay + HD render</strong> — residential-egress extraction + premium render farm: 1080p60 with zero cookies, beats the bot wall.</li>
-                    <li><strong className="text-foreground">4 · Community relays</strong> — public Piped/Invidious instances as backup.</li>
-                    <li><strong className="text-foreground">Cookies</strong> — optional booster, never a requirement.</li>
+                    <li><strong className="text-foreground">1 · 1080p first try</strong> — your range is rendered true 1080p60 (h264+aac) by the premium render farm. Only the clip crosses the wire.</li>
+                    <li><strong className="text-foreground">2 · 4K farm</strong> — 2K/4K picks render the source in TRUE 2160p (3840×2160 AV1) via the 4K farm and its registered API key; fclip stream-cuts the range locally.</li>
+                    <li><strong className="text-foreground">3 · Graceful degrade</strong> — if every 4K lane is busy, a 4K pick lands as true 1080p60. Never 360p.</li>
                   </ol>
                 </CardContent>
               </Card>
@@ -1267,9 +1250,9 @@ export default function Home() {
           <h2 className="mb-4 text-center text-lg font-bold">Why fclip</h2>
           <div className="grid gap-3 sm:grid-cols-3">
             {[
-              { icon: Zap, title: "Byte-range cutting", text: "A 30-second cut from a 4 GB 4K video transfers a fraction of the file — yt-dlp seeks straight into the stream." },
-              { icon: Wand2, title: "Cookie-free by design", text: "PO-token sessions, client storms and a relay network get clips through without any YouTube login." },
-              { icon: Gauge, title: "Original quality", text: "Up to 2160p with zero re-encoding — fast cuts are keyframe-snapped stream copies." },
+              { icon: Zap, title: "1080p60 on the first try", text: "Your range goes straight to the premium render farm and comes back as a finished h264+aac clip — no byte-range scavenging, no retries." },
+              { icon: Wand2, title: "TRUE 4K, no cookies", text: "4K picks render on the 4K farm as 3840×2160 AV1 via its registered API key — the server's IP never talks to YouTube." },
+              { icon: Gauge, title: "Original quality", text: "Stream-copy cutting — no re-encode, no watermark, the exact bytes the farm rendered." },
             ].map((s) => (
               <Card key={s.title} className="border-white/10 bg-white/[0.03]">
                 <CardContent className="p-4">
@@ -1290,7 +1273,7 @@ export default function Home() {
               <AccordionTrigger className="text-sm">Is fclip really free?</AccordionTrigger>
               <AccordionContent className="text-sm leading-relaxed text-muted-foreground">
                 Yes — no account, no watermark, no per-clip limits. fclip is a self-hostable web app built on
-                the open-source <strong className="text-foreground">yt-dlp</strong> and{" "}
+                the <strong className="text-foreground">render-farm</strong> and{" "}
                 <strong className="text-foreground">ffmpeg</strong> engines. Self-hosting it on your own
                 machine keeps everything free and private.
               </AccordionContent>
@@ -1298,21 +1281,19 @@ export default function Home() {
             <AccordionItem value="q2" className="border-b border-white/5 px-4 last:border-b-0">
               <AccordionTrigger className="text-sm">How does it work without cookies?</AccordionTrigger>
               <AccordionContent className="text-sm leading-relaxed text-muted-foreground">
-                Three independent routes, tried in order: (1) yt-dlp with automatically minted BotGuard
-                proof-of-origin tokens; (2) a parallel &ldquo;storm&rdquo; of YouTube player identities until one
-                breaks through the bot wall; (3) a relay network of public Piped/Invidious instances that fetch
-                and proxy the media through their own IPs. Cookies are an optional booster for edge cases
-                (private or age-restricted videos) — never a requirement.
+                fclip never touches YouTube&rsquo;s bot-walled stream endpoints. Two render-farm relays do the
+                heavy lifting from their own networks: the HD farm renders your exact seconds in true
+                1080p60, and the 4K farm renders the source in 3840×2160 for 2K/4K picks. No cookies, no
+                login, no player-identity tricks — the farm&rsquo;s own quota covers the work.
               </AccordionContent>
             </AccordionItem>
             <AccordionItem value="q3" className="border-b border-white/5 px-4 last:border-b-0">
               <AccordionTrigger className="text-sm">How can it cut 4K without downloading the whole 4 GB file?</AccordionTrigger>
               <AccordionContent className="text-sm leading-relaxed text-muted-foreground">
-                Modern video streams are split into small segments that players request over HTTP. yt-dlp
-                seeks into the stream with byte-range requests and downloads only the fragments covering your
-                selected seconds (plus a little padding to the previous keyframe), then ffmpeg trims and
-                remuxes locally. A 30-second 4K cut typically transfers a few hundred megabytes instead of
-                gigabytes.
+                The 4K farm renders the source once (renders are cached upstream per video, so repeat
+                requests land fast) and fclip downloads only the prefix that covers your seconds — the
+                file is moov-at-head, so a partial download stays cuttable — then ffmpeg stream-copies
+                your range locally. No gigabyte-sized transfers for a 30-second cut.
               </AccordionContent>
             </AccordionItem>
             <AccordionItem value="q4" className="px-4">
@@ -1337,24 +1318,10 @@ export default function Home() {
           </p>
           <p className="flex items-center gap-1.5">
             <Globe className="h-3.5 w-3.5" aria-hidden />
-            fclip · powered by yt-dlp + ffmpeg
+            fclip · render-farm engine + ffmpeg
           </p>
         </div>
       </footer>
-
-      <CookiesDialog
-        open={cookiesOpen}
-        onOpenChange={setCookiesOpen}
-        cookiesPresent={cookiesPresent}
-        onSaved={() => {
-          setCookiesPresent(true);
-          toast({ title: "Cookies saved", description: "They will be used for all fetches from now on." });
-        }}
-        onCleared={() => {
-          setCookiesPresent(false);
-          toast({ title: "Cookies removed" });
-        }}
-      />
 
       <Dialog open={diagOpen} onOpenChange={setDiagOpen}>
         <DialogContent className="border-white/10 bg-background/95 sm:max-w-lg">
@@ -1363,7 +1330,7 @@ export default function Home() {
               <Activity className="h-4 w-4 text-fuchsia-400" aria-hidden /> Engine diagnostics
             </DialogTitle>
             <DialogDescription className="text-xs">
-              Live status of the cutting pipeline — cookie names are never shown, only health.
+              Live status of the render-farm pipeline — lane reachability and engine health.
             </DialogDescription>
           </DialogHeader>
           <DiagPanel open={diagOpen} />

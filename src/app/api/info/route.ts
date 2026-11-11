@@ -17,9 +17,9 @@ export async function POST(req: Request) {
         { status: 400 }
       );
     }
-    // Fail fast (and clearly) on hosts that cannot run yt-dlp/ffmpeg, e.g. Vercel.
+    // Fail fast (and clearly) on hosts that cannot run ffmpeg, e.g. Vercel.
     const engine = await checkEngine();
-    if (!engine.ytDlp || !engine.ffmpeg) {
+    if (!engine.ffmpeg) {
       return NextResponse.json(
         { error: { code: "engine_missing", message: engineMissingMessage() }, engine, vercel: isVercel() },
         { status: 500 }
