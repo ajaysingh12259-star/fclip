@@ -100,6 +100,19 @@ Railway runs Docker images with persistent volumes — exactly what fclip needs.
 3. (Recommended) Set the `FCLIP_YT_COOKIES` variable with a `cookies.txt` export
    from a throwaway Google account — see section 5.
 4. **Settings → Networking → Generate Domain** to get a public URL.
+5. **4K tuning (optional):**
+   - `FCLIP_SAVENOW_API_KEY` — your own key from
+     [video-download-api.com](https://video-download-api.com) (free test tier:
+     25 requests after email confirmation). The built-in shared key's quota
+     pool is global and often dry; an owned key skips the queue and makes the
+     TRUE 4K render lane (2160p AV1) reliable.
+   - `FCLIP_EGRESS_PROXIES` — comma/whitespace separated `socks5h://` or
+     `http://` proxy URLs (residential/ISP exits). fclip health-checks each
+     one by fetching its real egress IP through it, then round-robins across
+     the healthy ones for every YouTube request — better bot-scoring than
+     raw datacenter IPs, and native (non-relay) 4K becomes possible when
+     YouTube unlists 2160p for DC ranges. Leave empty to use the built-in
+     Cloudflare WARP sidecar, which is tried after the pool.
 
 Healthchecks hit `/api/health`, so you can watch the deploy go green.
 

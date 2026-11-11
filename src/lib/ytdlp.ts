@@ -152,6 +152,8 @@ const g = globalThis as unknown as {
   __fclipMwebOk: boolean | undefined;
   __fclipStormClient: { at: number; client: string } | undefined;
   __fclipProxyOk: { at: number; ok: boolean } | undefined;
+  __fclipEgressPick: { at: number; proxy: string; ip: string } | undefined;
+  __fclipEgressHealth: Map<string, { at: number; ok: boolean; ip: string | null }> | undefined;
   __fclipEngine: { at: number; status: EngineStatus } | undefined;
   __fclipRelay: { at: number; videoId: string; formats: RelayFormat[]; duration: number | null } | undefined;
 };
@@ -273,54 +275,141 @@ const STORM_PATH = path.join(DATA_DIR, "storm.json");
 /* ------------------------------------------------------------------ */
 
 /**
- * Raw datacenter IPs get hard-flagged by YouTube's bot scoring; egress
- * through Cloudflare's WARP network scores far better (the approach used in
- * production by yt-dlp-rescue). The container entrypoint runs a wireproxy
- * socks5 sidecar on 127.0.0.1:1080 when WARP is reachable; we probe it and
- * route YouTube attempts through it. Disable with FCLIP_WARP_PROXY="".
+ * Raw datacenter IPs get hard-flagged by YouTube's bot scoring. Egress
+ * candidates, tried in order:
+ *  1. FCLIP_EGRESS_PROXIES — comma/whitespace separated socks5h:// or http://
+ *     proxy URLs (residential/ISP exits). Every candidate is health-checked
+ *     by fetching a real HTTPS endpoint THROUGH it ("real IP selection": an
+ *     open port is not enough, we want the egress IP it gives us), and the
+ *     pick round-robins across all healthy exits so traffic spreads out.
+ *  2. The Cloudflare WARP socks5 sidecar (127.0.0.1:1080, wireproxy) — the
+ *     container entrypoint keeps it alive; Cloudflare egress scores far
+ *     better with YouTube's bot scoring than raw DC IPs (the approach used
+ *     in production by yt-dlp-rescue). PROBE WARMUP FIX: a cold wireguard
+ *     tunnel needs DNS + handshake + TLS ≈ 2-5s before the first answer,
+ *     while the wireproxy log shows the handshake response arriving in well
+ *     under a second — the old 2s single-try budget pronounced healthy
+ *     tunnels "dead" on every boot. First probe now allows 3×8s.
+ *  3. Direct egress (no proxy args at all).
+ * Disable the WARP sidecar with FCLIP_WARP_PROXY="".
  */
 const WARP_PROXY = process.env.FCLIP_WARP_PROXY ?? "socks5h://127.0.0.1:1080";
 
-async function probeProxy(hold: number): Promise<boolean> {
-  // End-to-end check: an open socks5 port is NOT enough — the wireguard
-  // tunnel behind it can be dead (UDP egress blocked), which would silently
-  // hang every request routed through it. Verify a real HTTPS fetch works.
-  if (!WARP_PROXY) return false;
-  const target = WARP_PROXY.replace(/^socks5h?:\/\//, "");
+const sleepMs = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function egressPool(): string[] {
+  return (process.env.FCLIP_EGRESS_PROXIES ?? "")
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/** Never log proxy credentials. */
+function maskProxy(p: string): string {
+  return p.replace(/\/\/[^@/]+@/, "//***@");
+}
+
+/** Public egress IP through a candidate proxy; null when the proxy is dead.
+ *  curl accepts both socks5h:// and http:// URLs in --proxy. */
+async function proxyEgressIp(proxy: string, timeoutS: number): Promise<string | null> {
   try {
-    await execFileAsync(
+    const { stdout } = await execFileAsync(
       "curl",
-      ["-s", "--socks5-hostname", target, "-m", String(Math.max(2, Math.ceil(hold / 1000))), "https://api.ipify.org"],
-      { timeout: hold + 3000 }
+      ["-s", "--proxy", proxy, "-m", String(timeoutS), "https://api.ipify.org"],
+      { timeout: (timeoutS + 3) * 1000, maxBuffer: 1 << 16 }
     );
-    return true;
+    const ip = stdout.trim();
+    return /^(\d{1,3}\.){3}\d{1,3}$/.test(ip) ? ip : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
-async function warpProxyArgs(): Promise<string[]> {
-  if (!WARP_PROXY) return [];
-  const cached = g.__fclipProxyOk;
-  if (cached && Date.now() - cached.at < 60_000) {
-    return cached.ok ? ["--proxy", WARP_PROXY] : [];
+async function probeProxy(hold: number, tries = 1): Promise<boolean> {
+  if (!WARP_PROXY) return false;
+  for (let i = 0; i < tries; i++) {
+    const ip = await proxyEgressIp(WARP_PROXY, Math.max(2, Math.ceil(hold / 1000)));
+    if (ip) return true;
+    if (i + 1 < tries) await sleepMs(1000);
   }
-  const ok = await probeProxy(400);
-  console.log(`[fclip-warp] probe ${WARP_PROXY}: ${ok ? "healthy" : "dead"}`);
-  g.__fclipProxyOk = { at: Date.now(), ok };
-  return ok ? ["--proxy", WARP_PROXY] : [];
+  return false;
+}
+
+const EGRESS_HEALTH_TTL = 5 * 60_000;
+const EGRESS_PICK_TTL = 60_000;
+
+/** Pick the egress proxy: user pool first (round-robin over healthy), then WARP. */
+async function pickEgress(): Promise<string | null> {
+  g.__fclipEgressHealth ??= new Map();
+  const pool = egressPool();
+  if (pool.length > 0) {
+    const cached = g.__fclipEgressPick;
+    if (cached && Date.now() - cached.at < EGRESS_PICK_TTL && pool.includes(cached.proxy)) {
+      return cached.proxy;
+    }
+    const now = Date.now();
+    const healthy: { proxy: string; ip: string }[] = [];
+    for (const p of pool) {
+      const h = g.__fclipEgressHealth.get(p);
+      if (h && now - h.at < EGRESS_HEALTH_TTL) {
+        if (h.ok && h.ip) healthy.push({ proxy: p, ip: h.ip });
+        continue;
+      }
+      const ip = await proxyEgressIp(p, 8);
+      g.__fclipEgressHealth.set(p, { at: now, ok: !!ip, ip });
+      console.log(`[fclip-egress] probe ${maskProxy(p)}: ${ip ? `healthy (egress ${ip})` : "dead"}`);
+      if (ip) healthy.push({ proxy: p, ip });
+    }
+    if (healthy.length > 0) {
+      const pick = healthy[Math.floor(Math.random() * healthy.length)];
+      g.__fclipEgressPick = { at: now, proxy: pick.proxy, ip: pick.ip };
+      return pick.proxy;
+    }
+    console.log("[fclip-egress] no healthy proxies in FCLIP_EGRESS_PROXIES — falling back");
+  }
+  if (WARP_PROXY) {
+    const cached = g.__fclipProxyOk;
+    if (cached && Date.now() - cached.at < 60_000) {
+      return cached.ok ? WARP_PROXY : null;
+    }
+    const cold = cached === undefined; // first probe of this process: tunnel is cold
+    const ok = await probeProxy(cold ? 8000 : 6000, cold ? 3 : 1);
+    console.log(`[fclip-warp] probe ${WARP_PROXY}: ${ok ? "healthy" : "dead"}${cold ? " (cold warmup, 3×8s)" : ""}`);
+    g.__fclipProxyOk = { at: Date.now(), ok };
+    return ok ? WARP_PROXY : null;
+  }
+  return null;
+}
+
+async function warpProxyArgs(): Promise<string[]> {
+  const p = await pickEgress();
+  return p ? ["--proxy", p] : [];
 }
 
 /** Sync cache-only read for contexts that cannot await (job retry handlers). */
 function warpProxyArgsSync(): string[] {
-  if (!WARP_PROXY) return [];
+  const pick = g.__fclipEgressPick;
+  if (pick && Date.now() - pick.at < EGRESS_PICK_TTL && pick.proxy) return ["--proxy", pick.proxy];
   const cached = g.__fclipProxyOk;
   return cached?.ok ? ["--proxy", WARP_PROXY] : [];
 }
 
-/** Diagnostics: is the WARP tunnel actually passing traffic end-to-end? */
-export async function warpHealth(): Promise<{ socks5: boolean }> {
-  return { socks5: await probeProxy(3000) };
+/** Diagnostics: WARP tunnel + user proxy pool, actually passing traffic? */
+export async function warpHealth(): Promise<{ socks5: boolean; pool: number; poolHealthy: number }> {
+  g.__fclipEgressHealth ??= new Map();
+  const pool = egressPool();
+  let poolHealthy = 0;
+  const now = Date.now();
+  for (const p of pool) {
+    let h = g.__fclipEgressHealth.get(p);
+    if (!h || now - h.at >= EGRESS_HEALTH_TTL) {
+      const ip = await proxyEgressIp(p, 8);
+      h = { at: now, ok: !!ip, ip };
+      g.__fclipEgressHealth.set(p, h);
+    }
+    if (h.ok) poolHealthy++;
+  }
+  return { socks5: await probeProxy(3000), pool: pool.length, poolHealthy };
 }
 
 function recordStormWinner(client: string): void {
@@ -438,7 +527,7 @@ async function stormBurst(args: string[], timeoutMs: number, rounds: number): Pr
     console.log(
       `[fclip-storm] round ${round}/${rounds}: ${clients.join(",")}${
         cookied.length ? " (web-family with cookies)" : " (cookie-less)"
-      }${egress.length ? " via WARP" : ""}`
+      }${egress.length ? " via egress" : ""}`
     );
     const attempts = clients.map((c) =>
       stormAttempt(

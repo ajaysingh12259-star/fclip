@@ -57,8 +57,18 @@ const execFileAsync = promisify(execFile);
 const SAVE_BASE = "https://p.savenow.to";
 const SAVE_BASE_FALLBACK = "https://p.lbserver.xyz";
 const ORIGIN = "https://en.loader.to";
-/** Shared frontend key shipped verbatim in en.loader.to's public JS. */
-const SHARED_FRONTEND_API_KEY = "dfcb6d76f2f6a9894gjkege8a4ab232222";
+/**
+ * Key priority: FCLIP_SAVENOW_API_KEY env var first — a key YOU registered at
+ * video-download-api.com (free test tier: 25 requests after email
+ * confirmation, more on paid plans) — measured 2026-11-11: the shared
+ * frontend key's quota pool is GLOBAL (all whitelisted referers —
+ * en.loader.to, loader.to, convertr.org — drain the same pool, referer
+ * rotation does NOT open new pools, PoW tokens and XFF spoofing don't help).
+ * An owned key skips the global pool entirely and is the only guaranteed
+ * 4K path when the shared pool is dry.
+ */
+const SHARED_FRONTEND_API_KEY =
+  process.env.FCLIP_SAVENOW_API_KEY || "dfcb6d76f2f6a9894gjkege8a4ab232222";
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
