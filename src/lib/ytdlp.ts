@@ -2,7 +2,7 @@ import { spawn, execFile, execFileSync, type ChildProcess } from "child_process"
 import { promisify } from "util";
 
 const execFileAsync = promisify(execFile);
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, rmSync, writeFileSync, createWriteStream } from "fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, statfsSync, rmSync, writeFileSync, createWriteStream } from "fs";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import path from "path";
@@ -1344,11 +1344,24 @@ async function relayCut(
             if (text) job.stage = `Relay: rendering 4K (${text.slice(0, 40)})`;
           },
         });
-        job.log.push(`[fclip] render farm returned ${render.fullFormat} — downloading the full source…`);
+        job.log.push(`[fclip] render farm returned ${render.fullFormat} — streaming the needed prefix…`);
         job.stage = "Relay: downloading rendered source";
         job.progress = 62;
+        // The farm serves the WHOLE source with no Range support, and a full
+        // 2160p render can blow the volume (measured live: ENOSPC on
+        // Railway). The mp4 has moov at head, so a truncated download stays
+        // cuttable — fetch only the bytes covering [start, start+dur+8s],
+        // capped by disk headroom. AV1 2160p60 worst case ≈ 5.2 MB/s of
+        // source time + 24 MB moov/metadata slack, floor 48 MB.
+        await cleanupOldJobs();
+        const free = await freeDiskBytes(CLIPS_DIR);
+        const needBytes = Math.round((params.start + dur + 8) * 5.2e6) + 24e6;
+        const maxBytes = Math.max(48e6, Math.min(needBytes, Math.max(0, free - 150e6)));
+        job.log.push(
+          `[fclip] prefix cap ${Math.round(maxBytes / 1e6)} MB (need ${Math.round(needBytes / 1e6)} MB, disk free ${Math.round(free / 1e6)} MB)`
+        );
         const full = path.join(dir, `savenow-${videoId}.mp4`);
-        const ok = await downloadTunnelFile(job, render.url, full);
+        const ok = await downloadTunnelFile(job, render.url, full, { maxBytes });
         if (ok) {
           job.stage = "Relay: cutting locally";
           job.progress = 95;
@@ -1358,7 +1371,28 @@ async function relayCut(
           } catch {
             /* best effort */
           }
-          return;
+          // A disk-capped prefix can truncate the range: verify the cut
+          // actually covers the request, else fall down the ladder.
+          const clips = readdirSync(dir)
+            .filter((f) => f.startsWith("clip.") && !f.endsWith(".part"))
+            .map((f) => path.join(dir, f))
+            .sort((a, b) => statSync(b).size - statSync(a).size);
+          const gotDur = clips.length > 0 ? await probeMediaDuration(clips[0]) : null;
+          if (gotDur === null || gotDur >= dur * 0.8) {
+            return;
+          }
+          job.log.push(
+            `[fclip] 4K cut came back short (${gotDur.toFixed(1)}s of ${dur.toFixed(0)}s — disk cap hit) — falling back…`
+          );
+          for (const f of clips) {
+            try {
+              rmSync(f, { force: true });
+            } catch {
+              /* best effort */
+            }
+          }
+          if (fmt === "1440") continue; // try the measured-good "4k" value
+          break; // 4k already failed — do not burn another throttle window
         }
         try {
           rmSync(full, { force: true });
@@ -1491,8 +1525,34 @@ async function ffmpegRelayUrlCut(
   job.progress = 100;
 }
 
-/** Stream a tunnel URL to disk with download progress (0–90%). */
-async function downloadTunnelFile(job: ClipJob, url: string, dest: string): Promise<boolean> {
+/** Free bytes on the filesystem holding p (statfsSync with a df fallback). */
+async function freeDiskBytes(p: string): Promise<number> {
+  try {
+    const s = statfsSync(p);
+    return Number(s.bavail) * Number(s.bsize);
+  } catch {
+    try {
+      const { stdout } = await execFileAsync("df", ["-k", "-P", p], { timeout: 8_000 });
+      const cols = (stdout.trim().split("\n").pop() ?? "").split(/\s+/);
+      const availKb = Number.parseInt(cols[3] ?? "0", 10);
+      return Number.isFinite(availKb) ? availKb * 1024 : 0;
+    } catch {
+      return 0;
+    }
+  }
+}
+
+/** Stream a tunnel URL to disk with download progress (0–90%).
+ *  maxBytes (optional): abort once the partial file reaches this size and
+ *  report SUCCESS — moov-at-head mp4s (savenow renders, cobalt) stay
+ *  cuttable, so a ranged cut only needs the prefix covering its range, and
+ *  the volume may not fit the whole render (measured: ENOSPC on Railway). */
+async function downloadTunnelFile(
+  job: ClipJob,
+  url: string,
+  dest: string,
+  opts: { maxBytes?: number } = {}
+): Promise<boolean> {
   // curl first — battle-tested against odd TLS/CDN setups and it streams
   // straight to disk with parseable progress. Native fetch failed on large
   // tunnel responses from Railway (measured live). If curl is missing the
@@ -1506,6 +1566,24 @@ async function downloadTunnelFile(job: ClipJob, url: string, dest: string): Prom
       );
       job.proc = child;
       let buf = "";
+      let capHit = false;
+      let capTimer: ReturnType<typeof setInterval> | null = null;
+      if (opts.maxBytes && opts.maxBytes > 0) {
+        capTimer = setInterval(() => {
+          try {
+            if (statSync(dest).size >= (opts.maxBytes ?? 0)) {
+              capHit = true;
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                /* already dead */
+              }
+            }
+          } catch {
+            /* file not created yet */
+          }
+        }, 400);
+      }
       child.stderr?.on("data", (d) => {
         buf += d.toString();
         const m = /(\d+(?:\.\d+)?)%/.exec(buf);
@@ -1514,9 +1592,17 @@ async function downloadTunnelFile(job: ClipJob, url: string, dest: string): Prom
           buf = buf.slice(-40);
         }
       });
-      child.on("error", () => resolve(false));
+      child.on("error", () => {
+        if (capTimer) clearInterval(capTimer);
+        resolve(false);
+      });
       child.on("close", (code) => {
+        if (capTimer) clearInterval(capTimer);
         if ((job.status as string) === "canceled") return resolve(false);
+        if (capHit) {
+          job.log.push(`[fclip] prefix cap reached (${Math.round((opts.maxBytes ?? 0) / 1e6)} MB) — enough for the cut`);
+          return resolve(true);
+        }
         let size = 0;
         try {
           size = statSync(dest).size;
@@ -1541,18 +1627,30 @@ async function downloadTunnelFile(job: ClipJob, url: string, dest: string): Prom
     }
     const total = Number(res.headers.get("content-length") ?? "0");
     let got = 0;
+    let capped = false;
     const counter = new TransformStream<Uint8Array, Uint8Array>({
       transform(chunk, ctrl) {
+        if (capped) return;
         got += chunk.byteLength;
+        if (opts.maxBytes && got >= opts.maxBytes) {
+          capped = true;
+          ctrl.terminate();
+          return;
+        }
         if (total > 0) job.progress = Math.min(90, Math.round((got / total) * 90));
         else job.progress = Math.min(85, Math.round(got / 2_000_000));
         ctrl.enqueue(chunk);
       },
     });
-    await pipeline(
-      Readable.fromWeb(res.body.pipeThrough(counter) as Parameters<typeof Readable.fromWeb>[0]),
-      createWriteStream(dest)
-    );
+    try {
+      await pipeline(
+        Readable.fromWeb(res.body.pipeThrough(counter) as Parameters<typeof Readable.fromWeb>[0]),
+        createWriteStream(dest)
+      );
+    } catch (e) {
+      if (!capped) throw e; // cap-stop is success-with-partial; real errors rethrow
+      if (capped) job.log.push(`[fclip] prefix cap reached (${Math.round((opts.maxBytes ?? 0) / 1e6)} MB) — enough for the cut`);
+    }
     return got > 0;
   } catch (e) {
     if ((job.status as string) !== "canceled") {
