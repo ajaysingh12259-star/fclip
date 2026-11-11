@@ -131,11 +131,6 @@ const jobs: Map<string, ClipJob> = (g.__fclipJobs ??= new Map());
 function rememberSourceDuration(videoId: string, duration: number | null) {
   g.__fclipDuration = { at: Date.now(), videoId, duration };
 }
-function cachedSourceDuration(videoId: string): number | null {
-  const r = g.__fclipDuration;
-  if (r && r.videoId === videoId && Date.now() - r.at < 30 * 60_000) return r.duration;
-  return null;
-}
 
 /* ------------------------------------------------------------------ */
 /* URL helpers                                                        */
@@ -317,45 +312,17 @@ export function createClipJob(params: CreateJobParams): ClipJob {
 /* The farm ladder                                                    */
 /* ------------------------------------------------------------------ */
 
-/**
- * 1KB/1s header probe — sanity check that a farm URL serves bytes.
- */
-async function urlServesBytes(url: string): Promise<boolean> {
-  try {
-    const { stdout } = await execFileAsync(
-      "curl",
-      ["-sS", "-L", "--fail", "--max-time", "15", "-r", "0-1023", "-o", "/dev/null", "-w", "%{http_code}", url],
-      { timeout: 20_000, encoding: "utf8" }
-    );
-    const code = Number.parseInt(stdout.trim(), 10);
-    return code === 200 || code === 206;
-  } catch {
-    return false;
-  }
-}
 
-/** Free bytes on the filesystem holding p (statfsSync with a df fallback). */
-async function freeDiskBytes(p: string): Promise<number> {
-  try {
-    const s = statfsSync(p);
-    return Number(s.bavail) * Number(s.bsize);
-  } catch {
-    try {
-      const { stdout } = await execFileAsync("df", ["-k", "-P", p], { timeout: 8_000 });
-      const cols = (stdout.trim().split("\n").pop() ?? "").split(/\s+/);
-      const availKb = Number.parseInt(cols[3] ?? "0", 10);
-      return Number.isFinite(availKb) ? availKb * 1024 : 0;
-    } catch {
-      return 0;
-    }
-  }
-}
 
 /**
  * THE LADDER.
- *  - 4K/2K picks: savenow 4K farm (registered API key) → degrade 1080p60.
- *  - ≤1080p picks: VideoLimit 1080p60 render FIRST TRY → (rare fallback)
- *    savenow 4K render + local range cut.
+ *  - 4K/2K picks: savenow 4K farm (registered API key) → videolimit 1080p60
+ *    → savenow 1080 render (last resort).
+ *  - ≤1080p picks: VideoLimit 1080p60 render FIRST TRY (fast when alive) →
+ *    savenow 1080 whole-source render.
+ *  Whole-source renders are STREAM-TRIMMED: the farm's download is piped
+ *  straight into ffmpeg, which stream-copies just the requested range —
+ *  zero disk usage, ranges anywhere in the source work.
  */
 async function runFarmLadder(job: ClipJob, params: CreateJobParams, dir: string): Promise<void> {
   const dur = Math.max(0.2, params.end - params.start);
@@ -366,88 +333,44 @@ async function runFarmLadder(job: ClipJob, params: CreateJobParams, dir: string)
     job.stage = "Failed";
     return;
   }
-  if (job.status === "canceled") return;
+  if ((job.status as string) === "canceled") return;
 
   const want4k = params.maxHeight != null && params.maxHeight >= 1440;
   const clipLen = params.end - params.start;
 
-  /* ---- 4K farm: whole-source render + local range cut ---- */
-  const tryFarm4k = async (): Promise<boolean> => {
+  /* ---- savenow farm: whole-source render in any format + stream-trim ---- */
+  const tryFarmSource = async (fmt: "4k" | "1080"): Promise<boolean> => {
     try {
       job.status = "running";
-      job.stage = "Farm: rendering full source (4K)";
+      job.stage = fmt === "4k" ? "Farm: rendering full source (4K)" : "Farm: rendering full source (1080p)";
       job.progress = 25;
-      job.log.push("[fclip] 4K farm — queueing the full source for a TRUE 2160p render (no cookies)…");
-      const render = await savenowRender(videoId, "4k", {
+      job.log.push(
+        fmt === "4k"
+          ? "[fclip] 4K farm — queueing the full source for a TRUE 2160p render (no cookies)…"
+          : "[fclip] 4K farm — queueing the full source for a 1080p render…"
+      );
+      const render = await savenowRender(videoId, fmt, {
         timeoutMs: 10 * 60_000,
         onProgress: (pct, text) => {
           if (pct >= 0) job.progress = Math.min(58, 25 + Math.round(pct * 0.33));
-          if (text) job.stage = `Farm: rendering 4K (${text.slice(0, 40)})`;
+          if (text) job.stage = `Farm: rendering ${fmt === "4k" ? "4K" : "1080p"} (${text.slice(0, 40)})`;
         },
       });
       if ((job.status as string) === "canceled") return false;
-      job.log.push(`[fclip] 4K farm returned ${render.fullFormat} — streaming the needed prefix…`);
-      job.stage = "Farm: downloading rendered source";
-      job.progress = 60;
-
-      // The farm serves the WHOLE source with no Range support; a full 2160p
-      // render can blow the volume (measured: ENOSPC on Railway). The mp4 is
-      // moov-at-head, so a truncated prefix stays cuttable — fetch only the
-      // bytes covering [start, start+dur+8s], capped by disk headroom.
-      // AV1 2160p60 worst case ≈ 5.2 MB/s of source time + 24 MB moov slack.
-      cleanupOldJobs();
-      const free = await freeDiskBytes(CLIPS_DIR);
-      const needBytes = Math.round((params.start + dur + 8) * 5.2e6) + 24e6;
-      const maxBytes = Math.max(48e6, Math.min(needBytes, Math.max(0, free - 150e6)));
-      job.log.push(
-        `[fclip] prefix cap ${Math.round(maxBytes / 1e6)} MB (need ${Math.round(needBytes / 1e6)} MB, disk free ${Math.round(free / 1e6)} MB)`
-      );
-      const full = path.join(dir, `farm-${videoId}.mp4`);
-      const ok = await downloadTunnelFile(job, render.url, full, { maxBytes, partialOk: true });
+      job.log.push(`[fclip] farm returned ${render.fullFormat} — stream-trimming the range (no temp file)…`);
+      job.stage = "Farm: stream-trimming the range";
+      job.progress = 62;
+      const ok = await streamTrimFromUrl(job, render.url, params.start, dur, dir);
       if (!ok) {
-        try {
-          rmSync(full, { force: true });
-        } catch {
-          /* best effort */
-        }
-        job.log.push("[fclip] 4K render download failed — trying next lane…");
+        job.log.push("[fclip] farm stream-trim failed — trying next lane…");
         return false;
       }
-      if ((job.status as string) === "canceled") return false;
-      job.stage = "Farm: cutting the range locally";
-      job.progress = 95;
-      await ffmpegLocalCut(job, full, params.start, dur, dir);
-      try {
-        rmSync(full, { force: true });
-      } catch {
-        /* best effort */
-      }
-      // A disk-capped prefix can truncate the range: verify the cut covers
-      // the request, else fall down the ladder.
-      const clips = readdirSync(dir)
-        .filter((f) => f.startsWith("clip.") && !f.endsWith(".part"))
-        .map((f) => path.join(dir, f))
-        .sort((a, b) => statSync(b).size - statSync(a).size);
-      const gotDur = clips.length > 0 ? await probeMediaDuration(clips[0]) : null;
-      if (gotDur === null || gotDur >= dur * 0.8) {
-        job.stage = "Finalizing";
-        job.progress = 100;
-        return true;
-      }
-      job.log.push(
-        `[fclip] 4K cut came back short (${gotDur.toFixed(1)}s of ${dur.toFixed(0)}s — disk cap hit) — falling back…`
-      );
-      for (const f of clips) {
-        try {
-          rmSync(f, { force: true });
-        } catch {
-          /* best effort */
-        }
-      }
-      return false;
+      job.stage = "Finalizing";
+      job.progress = 100;
+      return true;
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      job.log.push(`[fclip] 4K farm unavailable: ${msg.slice(0, 140)}`);
+      job.log.push(`[fclip] ${fmt === "4k" ? "4K" : "1080p"} farm unavailable: ${msg.slice(0, 140)}`);
       return false;
     }
   };
@@ -482,12 +405,16 @@ async function runFarmLadder(job: ClipJob, params: CreateJobParams, dir: string)
   };
 
   if (want4k) {
-    if (await tryFarm4k()) {
+    if (await tryFarmSource("4k")) {
       await finalizeJob(job, dir);
       return;
     }
-    // Every 4K lane refused: degrade to the true 1080p60 render — never 360p.
+    // Every 4K lane refused: degrade to true 1080p60 — never 360p.
     if (await tryFarm1080()) {
+      await finalizeJob(job, dir);
+      return;
+    }
+    if (await tryFarmSource("1080")) {
       await finalizeJob(job, dir);
       return;
     }
@@ -497,25 +424,18 @@ async function runFarmLadder(job: ClipJob, params: CreateJobParams, dir: string)
       await finalizeJob(job, dir);
       return;
     }
-    // Rare fallback: the 4K farm + local cut still delivers. Only sane when
-    // the needed prefix actually fits the disk.
-    const free = await freeDiskBytes(CLIPS_DIR);
-    const needBytes = Math.round((params.start + dur + 8) * 5.2e6) + 24e6;
-    if (needBytes <= free - 150e6) {
-      if (await tryFarm4k()) {
-        await finalizeJob(job, dir);
-        return;
-      }
-    } else {
-      job.log.push(
-        `[fclip] 4K fallback skipped — prefix needs ${Math.round(needBytes / 1e6)} MB but only ${Math.round(free / 1e6)} MB free`
-      );
+    // HD farm refused (credits gate, walled range…) — the savenow farm
+    // renders the source in 1080p and we stream-trim the range. No disk
+    // needed, so ranges anywhere in the source work.
+    if (await tryFarmSource("1080")) {
+      await finalizeJob(job, dir);
+      return;
     }
   }
 
   job.status = "error";
   job.error =
-    "Both render lanes refused this clip. The 4K farm may be out of quota (its key needs a top-up) and the HD farm rejected the range — try again in a minute, or pick a shorter range.";
+    "All render lanes refused this clip. The 4K farm may be out of quota (its key needs a top-up) and the HD farm rejected the range — try again in a minute, or pick a shorter range.";
   job.stage = "Failed";
 }
 
@@ -653,61 +573,122 @@ async function downloadTunnelFile(
   }
 }
 
-/** Stream-copy the selected range out of a local file (fast, lossless). */
-async function ffmpegLocalCut(job: ClipJob, src: string, start: number, dur: number, dir: string): Promise<void> {
-  // Container must follow BOTH codecs: the 4K farm hands us AV1 + AAC — AAC
-  // is NOT valid in WebM, so an AV1+AAC source must stay mp4. VP9/Opus
-  // sources (relay tunnels of the past) went webm.
-  let ext = "mp4";
-  try {
-    const { stdout } = await execFileAsync(
-      FFPROBE,
-      ["-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0", src],
-      { timeout: 15_000 }
-    );
-    const codecs = stdout
-      .trim()
-      .split("\n")
-      .map((s) => s.trim().toLowerCase())
-      .filter(Boolean);
-    const v = codecs.find((c) => /^(h264|hevc|vp8|vp9|av1|mpeg4)$/.test(c)) ?? "";
-    const a = codecs.find((c) => /^(aac|opus|vorbis|mp3|flac)$/.test(c)) ?? "";
-    if (/^(vp8|vp9|av1)$/.test(v) && (a === "" || /^(opus|vorbis)$/.test(a))) ext = "webm";
-  } catch {
-    /* probe failed — default to mp4 */
-  }
-  const out = path.join(dir, ext === "webm" ? "clip.webm" : "clip.mp4");
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn(
-      FFMPEG,
-      [
-        "-hide_banner", "-loglevel", "error", "-nostats", "-y",
-        "-ss", String(start),
-        "-i", src,
-        "-t", String(dur),
-        "-c", "copy",
-        ...(ext === "webm" ? [] : ["-movflags", "faststart"]),
-        out,
-      ],
+/**
+ * STREAM-TRIM: pipe the farm's whole-source download through ffmpeg and
+ * stream-copy just [startSec, startSec+durSec] into clip.mp4.
+ *
+ * The farm's hosts ignore HTTP Range (measured), so seeking means reading
+ * from byte 0 — fine: ffmpeg reads the pipe LINEARLY (mp4 with moov at head
+ * needs no seek to demux) and OUTPUT-side -ss drops every packet before the
+ * range, stream-copying the rest. Measured live: a 60s-in range from a
+ * 1080p whole-source render came back as an exact 9.99s h264 1080p60 clip,
+ * ~2 MB, no temp file. NOTE: input-side -ss (demuxer index seek) FAILS on
+ * a pipe ("partial file") — never move -ss before -i here.
+ * Farm output is AV1+AAC (4K) or h264+AAC (1080) in mp4 — mp4 out, no mux
+ * surprises.
+ */
+async function streamTrimFromUrl(
+  job: ClipJob,
+  url: string,
+  startSec: number,
+  durSec: number,
+  dir: string
+): Promise<boolean> {
+  const out = path.join(dir, "clip.mp4");
+  return new Promise<boolean>((resolve) => {
+    const curl = spawn(
+      "curl",
+      ["-sS", "-L", "--fail", "--max-time", "900", "-o", "-", url],
       { stdio: ["ignore", "pipe", "pipe"] }
     );
-    job.proc = child;
-    let err = "";
-    child.stderr?.on("data", (d) => {
-      err += d.toString();
-      if (err.length > 4000) err = err.slice(-4000);
+    const ff = spawn(
+      FFMPEG,
+      [
+        "-hide_banner", "-loglevel", "error", "-nostats", "-progress", "pipe:1", "-y",
+        "-i", "pipe:0",
+        // OUTPUT-side seek: linear read + packet drop (input-side seek would
+        // need a seekable stream and dies on the pipe).
+        "-ss", String(startSec),
+        "-t", String(durSec),
+        "-c", "copy",
+        "-movflags", "faststart",
+        out,
+      ],
+      { stdio: ["pipe", "pipe", "pipe"] }
+    );
+    job.proc = ff;
+
+    let settled = false;
+    const done = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(guard);
+      try { curl.kill("SIGKILL"); } catch { /* already dead */ }
+      try { ff.kill("SIGKILL"); } catch { /* already dead */ }
+      if (!ok) {
+        try { rmSync(out, { force: true }); } catch { /* best effort */ }
+      }
+      resolve(ok);
+    };
+    // Overall guard — farm downloads can stall; never wedge the job.
+    const guard = setTimeout(() => {
+      job.log.push("[fclip] stream-trim timed out");
+      done(false);
+    }, 15 * 60_000);
+
+    let curlBytes = 0;
+    curl.stdout.on("data", (d) => {
+      curlBytes += d.length;
+      // ffmpeg is reading/discarding the source prefix — show movement
+      if (curlBytes > 4e6 && job.progress < 70) {
+        job.progress = Math.min(70, 62 + Math.round(curlBytes / 8e6));
+      }
     });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if ((job.status as string) === "canceled") return resolve();
-      if (code === 0) resolve();
-      else reject(new Error(`local cut ffmpeg exited ${code}: ${err.trim().slice(-180)}`));
+    curl.stdout.pipe(ff.stdin);
+    curl.stderr?.on("data", (d) => {
+      const l = d.toString().trim();
+      if (l) job.log.push(`[farm-curl] ${l.slice(0, 200)}`);
+    });
+    curl.on("error", (e) => {
+      job.log.push(`[fclip] farm download error: ${String(e.message).slice(0, 140)}`);
+      done(false);
+    });
+
+    let ffErr = "";
+    ff.stdout?.on("data", (d) => {
+      const m = /out_time_ms=(\d+)/.exec(d.toString());
+      if (m) {
+        const t = Number(m[1]) / 1e6;
+        if (Number.isFinite(t) && durSec > 0) {
+          job.progress = Math.min(96, Math.max(70, Math.round((t / durSec) * 34) + 62));
+        }
+      }
+    });
+    ff.stderr?.on("data", (d) => {
+      ffErr += d.toString();
+      if (ffErr.length > 4000) ffErr = ffErr.slice(-4000);
+    });
+    ff.on("error", () => done(false));
+    ff.on("close", async (code) => {
+      if (settled) return;
+      if ((job.status as string) === "canceled") return done(false);
+      if (code !== 0) {
+        job.log.push(`[fclip] stream-trim ffmpeg exited ${code}: ${ffErr.trim().slice(-160)}`);
+        return done(false);
+      }
+      // Verify the trimmed cut actually covers the requested range.
+      const gotDur = await probeMediaDuration(out);
+      if (gotDur === null || gotDur < durSec * 0.8) {
+        job.log.push(
+          `[fclip] stream-trim came back short (${gotDur?.toFixed(1) ?? "?"}s of ${durSec.toFixed(0)}s)`
+        );
+        return done(false);
+      }
+      done(true);
     });
   });
-  if ((job.status as string) === "canceled") return;
-  job.stage = "Processing with ffmpeg";
-  job.progress = 100;
 }
+
 
 async function finalizeJob(job: ClipJob, dir: string) {
   try {
