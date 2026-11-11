@@ -1361,7 +1361,7 @@ async function relayCut(
           `[fclip] prefix cap ${Math.round(maxBytes / 1e6)} MB (need ${Math.round(needBytes / 1e6)} MB, disk free ${Math.round(free / 1e6)} MB)`
         );
         const full = path.join(dir, `savenow-${videoId}.mp4`);
-        const ok = await downloadTunnelFile(job, render.url, full, { maxBytes });
+        const ok = await downloadTunnelFile(job, render.url, full, { maxBytes, partialOk: true });
         if (ok) {
           job.stage = "Relay: cutting locally";
           job.progress = 95;
@@ -1546,12 +1546,15 @@ async function freeDiskBytes(p: string): Promise<number> {
  *  maxBytes (optional): abort once the partial file reaches this size and
  *  report SUCCESS — moov-at-head mp4s (savenow renders, cobalt) stay
  *  cuttable, so a ranged cut only needs the prefix covering its range, and
- *  the volume may not fit the whole render (measured: ENOSPC on Railway). */
+ *  the volume may not fit the whole render (measured: ENOSPC on Railway).
+ *  partialOk: a non-zero exit with bytes already on disk counts as success
+ *  (moov-at-head partials are cuttable; measured live: the farm's rotating
+ *  hosts RST mid-transfer and curl ENOSPCs — the prefix was still good). */
 async function downloadTunnelFile(
   job: ClipJob,
   url: string,
   dest: string,
-  opts: { maxBytes?: number } = {}
+  opts: { maxBytes?: number; partialOk?: boolean } = {}
 ): Promise<boolean> {
   // curl first — battle-tested against odd TLS/CDN setups and it streams
   // straight to disk with parseable progress. Native fetch failed on large
@@ -1609,7 +1612,12 @@ async function downloadTunnelFile(
         } catch {
           /* no file */
         }
-        resolve(code === 0 && size > 0);
+        if (code === 0 && size > 0) return resolve(true);
+        if (opts.partialOk && size > 0) {
+          job.log.push(`[fclip] partial download kept (${Math.round(size / 1e6)} MB on disk, moov-at-head cuttable)`);
+          return resolve(true);
+        }
+        resolve(false);
       });
     });
     if (ok) return true;
@@ -1648,8 +1656,16 @@ async function downloadTunnelFile(
         createWriteStream(dest)
       );
     } catch (e) {
-      if (!capped) throw e; // cap-stop is success-with-partial; real errors rethrow
-      if (capped) job.log.push(`[fclip] prefix cap reached (${Math.round((opts.maxBytes ?? 0) / 1e6)} MB) — enough for the cut`);
+      if (!capped) {
+        // partialOk: keep whatever reached the disk — moov-at-head partials
+        // are cuttable (the farm's hosts RST mid-transfer under load).
+        if (opts.partialOk && got > 0) {
+          job.log.push(`[fclip] partial download kept (${Math.round(got / 1e6)} MB on disk, moov-at-head cuttable)`);
+          return true;
+        }
+        throw e;
+      }
+      job.log.push(`[fclip] prefix cap reached (${Math.round((opts.maxBytes ?? 0) / 1e6)} MB) — enough for the cut`);
     }
     return got > 0;
   } catch (e) {
@@ -1847,8 +1863,20 @@ export function cleanupOldJobs() {
       removeJob(j.id);
     }
   }
-  // Disk guard: cap finished clips at ~1.5 GB total.
+  // Disk guard: cap finished clips at ~1.5 GB total AND keep real free
+  // space on the filesystem ≥ 450 MB. The size cap alone never fires on
+  // small volumes (measured: Railway volume sat at 70 MB free with the
+  // 1.5 GB guard still satisfied) — free-space pruning is what actually
+  // rescues the 4K render prefix downloads.
   try {
+    const freeNow = (): number => {
+      try {
+        const s = statfsSync(CLIPS_DIR);
+        return Number(s.bavail) * Number(s.bsize);
+      } catch {
+        return Infinity;
+      }
+    };
     let total = 0;
     const entries: { id: string; size: number; mtime: number }[] = [];
     for (const dir of readdirSync(CLIPS_DIR)) {
@@ -1865,7 +1893,8 @@ export function cleanupOldJobs() {
       }
     }
     entries.sort((a, b) => a.mtime - b.mtime);
-    while (total > 1.5e9 && entries.length > 0) {
+    let free = freeNow();
+    while ((total > 1.5e9 || free < 450e6) && entries.length > 0) {
       const oldest = entries.shift() as { id: string; size: number };
       const job = jobs.get(oldest.id);
       if (job && job.status !== "running") removeJob(oldest.id);
@@ -1877,6 +1906,7 @@ export function cleanupOldJobs() {
         }
       }
       total -= oldest.size;
+      free = freeNow();
     }
   } catch {
     /* ignore */
