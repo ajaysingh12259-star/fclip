@@ -7,6 +7,15 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /* GET — stream the demo video with HTTP Range support so yt-dlp/ffmpeg can seek into it */
+
+/** Abort-safe response wrapper — see api/clip/file/route.ts for the why. */
+function toWebResponse(stream: Readable, status: number, headers: Headers): Response {
+  stream.on("error", () => {
+    /* client aborts are expected — do not crash the process */
+  });
+  return new Response(Readable.toWeb(stream) as unknown as ReadableStream, { status, headers });
+}
+
 export async function GET(req: Request) {
   if (!existsSync(DEMO_PATH)) {
     try {
@@ -36,11 +45,11 @@ export async function GET(req: Request) {
     headers.set("Content-Range", `bytes ${start}-${end}/${stat.size}`);
     headers.set("Content-Length", String(end - start + 1));
     const stream = createReadStream(DEMO_PATH, { start, end });
-    return new Response(Readable.toWeb(stream) as unknown as ReadableStream, { status: 206, headers });
+    return toWebResponse(stream, 206, headers);
   }
 
   const headers = new Headers(baseHeaders);
   headers.set("Content-Length", String(stat.size));
   const stream = createReadStream(DEMO_PATH);
-  return new Response(Readable.toWeb(stream) as unknown as ReadableStream, { status: 200, headers });
+  return toWebResponse(stream, 200, headers);
 }

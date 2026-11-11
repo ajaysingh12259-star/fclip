@@ -12,6 +12,22 @@ function safeTitle(title: string): string {
   return cleaned || "video";
 }
 
+/**
+ * Wrap a file stream for a Response WITHOUT letting client aborts crash the
+ * process: when the HTTP client disconnects mid-body (browser <video> seek,
+ * closed tab, range probe), the pipe tears down the Readable.toWeb adapter
+ * while the fs stream also errors → "Invalid state: Controller is already
+ * closed" escaped as uncaughtException and restarted the container, wiping
+ * every in-memory job. Attaching a no-op error handler on the source stream
+ * keeps the abort fully contained. (Measured live on Railway, 2026-11-11.)
+ */
+function toWebResponse(stream: Readable, status: number, headers: Headers): Response {
+  stream.on("error", () => {
+    /* client aborts and FS hiccups are expected here — do not crash */
+  });
+  return new Response(Readable.toWeb(stream) as unknown as ReadableStream, { status, headers });
+}
+
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const jobId = searchParams.get("jobId");
@@ -51,11 +67,9 @@ export async function GET(req: Request) {
     }
     headers.set("Content-Range", `bytes ${start}-${end}/${stat.size}`);
     headers.set("Content-Length", String(end - start + 1));
-    const stream = createReadStream(filePath, { start, end });
-    return new Response(Readable.toWeb(stream) as unknown as ReadableStream, { status: 206, headers });
+    return toWebResponse(createReadStream(filePath, { start, end }), 206, headers);
   }
 
   headers.set("Content-Length", String(stat.size));
-  const stream = createReadStream(filePath);
-  return new Response(Readable.toWeb(stream) as unknown as ReadableStream, { status: 200, headers });
+  return toWebResponse(createReadStream(filePath), 200, headers);
 }
